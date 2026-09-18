@@ -19,3 +19,36 @@ result-*
 # ملفات IDE
 .vscode/
 .idea/
+
+# ===== SHAHEEN-YS Platform Security =====
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Dependencies
+node_modules/
+platform/*/node_modules/
+
+# Logs
+*.log
+logs/
+
+# Build
+dist/
+build/
+coverage/
+
+# OS
+.DS_Store
+Thumbs.db
