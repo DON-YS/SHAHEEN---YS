@@ -1,54 +1,56 @@
-/**
- * SHAHEEN-YS Database Configuration
- * SQLite-based for portability, easily swappable to PostgreSQL
- */
-const Database = require('better-sqlite3');
-const path = require('path');
-const fs = require('fs');
+const fs = require("fs");
+const path = require("path");
+const Database = require("better-sqlite3");
 
-const DB_PATH = process.env.DATABASE_PATH || './data/shaheen.db';
-const dbDir = path.dirname(DB_PATH);
+const databasePath =
+  process.env.DATABASE_PATH || "./data/shaheen-ys.db";
 
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
-}
+const resolvedPath = path.isAbsolute(databasePath)
+  ? databasePath
+  : path.resolve(process.cwd(), databasePath);
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+fs.mkdirSync(path.dirname(resolvedPath), {
+  recursive: true
+});
 
-// Initialize schema
+const db = new Database(resolvedPath);
+
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
-    email TEXT UNIQUE NOT NULL,
-    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
     password_hash TEXT,
-    provider TEXT DEFAULT 'email',
+    name TEXT,
+    role TEXT NOT NULL DEFAULT 'user',
+    provider TEXT,
     provider_id TEXT,
-    email_verified INTEGER DEFAULT 0,
-    role TEXT DEFAULT 'user',
-    subscription_id TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    email_verified INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS audit_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT PRIMARY KEY,
     user_id TEXT,
     action TEXT NOT NULL,
-    resource TEXT,
-    result TEXT,
-    ip TEXT,
+    ip_address TEXT,
     user_agent TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    metadata TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
   );
 
-  CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-  CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
-  CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
-`);
+  CREATE INDEX IF NOT EXISTS idx_users_email
+  ON users(email);
 
-console.log('✅ Database initialized at:', DB_PATH);
+  CREATE INDEX IF NOT EXISTS idx_audit_user
+  ON audit_logs(user_id);
+
+  CREATE INDEX IF NOT EXISTS idx_audit_created
+  ON audit_logs(created_at);
+`);
 
 module.exports = db;

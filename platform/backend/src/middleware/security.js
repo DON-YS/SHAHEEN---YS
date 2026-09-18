@@ -1,48 +1,43 @@
-/**
- * SHAHEEN-YS Security Middleware
- * Centralized security configuration
- */
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
+const helmet = require("helmet");
+const rateLimit =
+  require("express-rate-limit");
 
-// Helmet configuration with CSP
-const helmetConfig = helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-      fontSrc: ["'self'", "https://fonts.gstatic.com"],
-      imgSrc: ["'self'", "data:", "https:"],
-      scriptSrc: ["'self'"],
-      connectSrc: ["'self'"],
-      frameSrc: ["'none'"],
-      objectSrc: ["'none'"],
-    },
-  },
-  crossOriginEmbedderPolicy: false,
-});
+const generalLimiter =
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 300,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: {
+      error:
+        "Too many requests. Please try again later."
+    }
+  });
 
-// Global rate limiter
-const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' },
-});
+const authLimiter =
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: {
+      error:
+        "Too many authentication attempts. Please try again later."
+    }
+  });
 
-// Auth rate limiter (stricter)
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many authentication attempts. Please wait.' },
-  skipSuccessfulRequests: true,
-});
+function securityMiddleware(app) {
+  app.use(
+    helmet({
+      contentSecurityPolicy: false
+    })
+  );
+
+  app.use(generalLimiter);
+}
 
 module.exports = {
-  helmetConfig,
-  globalLimiter,
-  authLimiter,
+  securityMiddleware,
+  generalLimiter,
+  authLimiter
 };

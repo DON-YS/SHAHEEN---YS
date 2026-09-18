@@ -1,82 +1,165 @@
-/**
- * SHAHEEN-YS Backend Server
- * Entry point for the platform API
- */
-require('dotenv').config();
+require("dotenv").config();
 
-const express = require('express');
-const cors = require('cors');
-const cookieParser = require('cookie-parser');
-const path = require('path');
+const express = require("express");
+const cookieParser =
+  require("cookie-parser");
+const cors = require("cors");
 
-const { helmetConfig, globalLimiter, authLimiter } = require('./middleware/security');
+const {
+  securityMiddleware
+} = require("./middleware/security");
 
-// Ensure DB is initialized
-require('./config/database');
+require("./config/database");
+
+const authRoutes =
+  require("./routes/auth.routes");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-// ===== Security =====
-app.use(helmetConfig);
+const PORT =
+  Number(process.env.PORT || 3000);
 
-// ===== CORS =====
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean);
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    cb(new Error('Not allowed by CORS'));
-  },
-  credentials: true,
-}));
+const HOST =
+  process.env.HOST || "0.0.0.0";
 
-// ===== Body Parsers =====
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+const allowedOrigins = (
+  process.env.ALLOWED_ORIGINS ||
+  "http://localhost:5173,http://127.0.0.1:5173"
+)
+  .split(",")
+  .map(
+    (origin) => origin.trim()
+  )
+  .filter(Boolean);
+
+securityMiddleware(app);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (
+        allowedOrigins.includes(origin)
+      ) {
+        return callback(null, true);
+      }
+
+      return callback(
+        new Error(
+          "Origin not allowed by CORS."
+        )
+      );
+    },
+    credentials: true
+  })
+);
+
+app.use(
+  express.json({
+    limit: "1mb"
+  })
+);
+
+app.use(
+  express.urlencoded({
+    extended: false,
+    limit: "1mb"
+  })
+);
+
 app.use(cookieParser());
 
-// ===== Rate Limiting =====
-app.use('/api/', globalLimiter);
+app.get(
+  "/health",
+  (req, res) => {
+    res.json({
+      status: "ok",
+      project: "SHAHEEN - YS",
+      phase: "Phase 1",
+      timestamp:
+        new Date().toISOString()
+    });
+  }
+);
 
-// ===== Health Check =====
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'SHAHEEN-YS',
-    version: '1.0.0',
-    timestamp: new Date().toISOString(),
-  });
-});
+app.use(
+  "/api/auth",
+  authRoutes
+);
 
-// ===== Routes =====
-app.use('/api/auth', authLimiter, require('./routes/auth'));
+app.use(
+  (req, res) => {
+    res.status(404).json({
+      error: "Route not found."
+    });
+  }
+);
 
-// ===== 404 =====
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
+app.use(
+  (
+    err,
+    req,
+    res,
+    next
+  ) => {
+    console.error(
+      "[ERROR]",
+      err
+    );
 
-// ===== Error Handler =====
-app.use((err, req, res, next) => {
-  console.error('[ERROR]', err.message);
-  const status = err.status || 500;
-  res.status(status).json({
-    error: process.env.NODE_ENV === 'production'
-      ? 'Internal server error'
-      : err.message,
-  });
-});
+    const status =
+      Number.isInteger(
+        err.status
+      ) &&
+      err.status >= 400
+        ? err.status
+        : 500;
 
-// ===== Start =====
-const server = app.listen(PORT, () => {
-  console.log(`✅ SHAHEEN-YS Backend running on port ${PORT}`);
-  console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
-});
+    res.status(status).json({
+      error:
+        status === 500
+          ? "Internal server error."
+          : err.message
+    });
+  }
+);
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down...');
-  server.close(() => process.exit(0));
-});
+const server =
+  app.listen(
+    PORT,
+    HOST,
+    () => {
+      console.log(
+        `[SHAHEEN-YS] Backend listening on ${HOST}:${PORT}`
+      );
+    }
+  );
 
-module.exports = app;
+function shutdown(signal) {
+  console.log(
+    `[SHAHEEN-YS] Received ${signal}. Shutting down...`
+  );
+
+  server.close(
+    () => {
+      console.log(
+        "[SHAHEEN-YS] Server stopped."
+      );
+
+      process.exit(0);
+    }
+  );
+}
+
+process.on(
+  "SIGTERM",
+  () => shutdown("SIGTERM")
+);
+
+process.on(
+  "SIGINT",
+  () => shutdown("SIGINT")
+);
