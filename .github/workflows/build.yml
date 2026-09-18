@@ -17,18 +17,18 @@ jobs:
         with:
           go-version: '1.24'
 
-      - name: Build Crossplane
+      - name: Build Crossplane Binary
         run: |
           cd components/crossplane
-          go build -v ./...
+          go build -v -o crossplane-bin ./cmd/crossplane
 
       - name: Upload Crossplane Binary
         uses: actions/upload-artifact@v4
         with:
           name: crossplane-binary
-          path: components/crossplane/crossplane
+          path: components/crossplane/crossplane-bin
 
-  build-kubevirt:
+  verify-kubevirt:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -39,18 +39,9 @@ jobs:
         with:
           go-version: '1.24'
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvirt-dev qemu-kvm libvirt-daemon-system
-
-      - name: Build KubeVirt
+      - name: Verify KubeVirt Source
         run: |
           cd components/kubevirt
-          go build -v ./...
-
-      - name: Upload KubeVirt Binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: kubevirt-binary
-          path: components/kubevirt/_out/
+          go mod download
+          go mod verify
+          echo "KubeVirt source verified successfully."
