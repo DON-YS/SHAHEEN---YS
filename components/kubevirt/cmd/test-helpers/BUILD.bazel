@@ -1,0 +1,17 @@
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+load("//bazel:image.bzl", "kubevirt_image")
+
+pkg_tar(
+    name = "test-pod-mutator-tar",
+    testonly = True,
+    srcs = ["//cmd/test-helpers/pod-mutator:test-pod-mutator"],
+    package_dir = "/usr/bin",
+)
+
+kubevirt_image(
+    name = "test-helpers-image",
+    testonly = True,
+    base = "//:passwd-image",
+    tars = [":test-pod-mutator-tar"],
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,1905 @@
+/*
+Copyright 2020 The Crossplane Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package resolver
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	pkgName "github.com/google/go-containerregistry/pkg/name"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/feature"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/fieldpath"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/resource/fake"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/test"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/xpkg"
+	fakexpkg "github.com/crossplane/crossplane-runtime/v2/pkg/xpkg/fake"
+
+	"github.com/crossplane/crossplane/apis/v2/pkg/v1beta1"
+	"github.com/crossplane/crossplane/v2/internal/dag"
+	fakedag "github.com/crossplane/crossplane/v2/internal/dag/fake"
+	"github.com/crossplane/crossplane/v2/internal/features"
+)
+
+const (
+	digest1 = "sha256:ecc25c121431dfc7058754427f97c034ecde26d4aafa0da16d258090e0443904"
+	digest2 = "sha256:3c25c121431dfc7058754427f97c034ecde26d4aafa0da16d258090e04439040"
+)
+
+var (
+	errBoom = errors.New("boom")
+	testLog = logging.NewLogrLogger(zap.New(zap.UseDevMode(true), zap.WriteTo(io.Discard)).WithName("testlog"))
+)
+
+func TestReconcile(t *testing.T) {
+	upgradesEnabled := &feature.Flags{}
+	upgradesEnabled.Enable(features.EnableAlphaDependencyVersionUpgrades)
+
+	type args struct {
+		mgr manager.Manager
+		req reconcile.Request
+		rec []ReconcilerOption
+	}
+
+	type want struct {
+		r   reconcile.Result
+		err error
+	}
+
+	cases := map[string]struct {
+		reason string
+		args   args
+		want   want
+	}{
+		"LockNotFound": {
+			reason: "We should not return and error and not requeue if lock not found.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{MockGet: test.NewMockGetFn(kerrors.NewNotFound(schema.GroupResource{}, ""))},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+			},
+			want: want{
+				r: reconcile.Result{Requeue: false},
+			},
+		},
+		"ErrGetLock": {
+			reason: "We should return an error if getting lock fails.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{MockGet: test.NewMockGetFn(errBoom)},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+			},
+			want: want{
+				err: errors.Wrap(errBoom, errGetLock),
+			},
+		},
+		"ErrRemoveFinalizer": {
+			reason: "We should return an error if we fail to remove finalizer.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: test.NewMockClient(),
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithFinalizer(resource.FinalizerFns{RemoveFinalizerFn: func(_ context.Context, _ resource.Object) error {
+						return errBoom
+					}}),
+				},
+			},
+			want: want{
+				err: errors.Wrap(errBoom, errRemoveFinalizer),
+			},
+		},
+		"SuccessfulEmptyList": {
+			reason: "We should not return error and not requeue if no packages in lock.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: test.NewMockClient(),
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+			},
+		},
+		"ErrAddFinalizer": {
+			reason: "We should return an error if we fail to add finalizer.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt reconciliation.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate: test.NewMockUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithFinalizer(resource.FinalizerFns{AddFinalizerFn: func(_ context.Context, _ resource.Object) error {
+						return errBoom
+					}}),
+				},
+			},
+			want: want{
+				err: errors.Wrap(errBoom, errAddFinalizer),
+			},
+		},
+		"ErrInitDag": {
+			reason: "We should not requeue if we fail to initialize DAG.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return nil, errBoom
+							},
+						}
+					}),
+				},
+			},
+			want: want{
+				err: errors.Wrap(errBoom, errBuildDAG),
+			},
+		},
+		"ErrSortDag": {
+			reason: "We should return an error if we fail to sort the DAG.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return nil, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, errBoom
+							},
+						}
+					}),
+				},
+			},
+			want: want{
+				err: errors.Wrap(errBoom, errSortDAG),
+			},
+		},
+		"SuccessfulNoMissing": {
+			reason: "We should not return error and not requeue if no missing dependencies.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return nil, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+				},
+			},
+			want: want{
+				r: reconcile.Result{Requeue: false},
+			},
+		},
+		"SuccessfulNoMissingWithDigest": {
+			reason: "We should not return error and not requeue if no missing dependencies with digest.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "cool-repo/cool-image",
+								Version: "sha256:ecc25c121431dfc7058754427f97c034ecde26d4aafa0da16d258090e0443904",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return nil, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+				},
+			},
+			want: want{
+				r: reconcile.Result{Requeue: false},
+			},
+		},
+		"ErrorInvalidDependency": {
+			reason: "We should not requeue if dependency is invalid.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package: "not.a.valid.package",
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+				},
+			},
+			want: want{
+				r:   reconcile.Result{Requeue: false},
+				err: errors.Wrap(errors.Wrap(errors.New("improper constraint: \"\""), errInvalidConstraint), errFindDependency),
+			},
+		},
+		"ErrorListVersions": {
+			reason: "We should return an error if fail to list package versions.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "registry1.com/acme-co/configuration-foo",
+											Constraints: "v0.0.1",
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn(nil, errBoom),
+					}),
+				},
+			},
+			want: want{
+				err: errors.Wrap(errors.Wrap(errBoom, errFetchTags), errFindDependency),
+			},
+		},
+		"ErrorFetchTags": {
+			reason: "We should return an error if fail to fetch tags to account for network issues.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "hasheddan/config-nop-b",
+											Constraints: "*",
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn(nil, errBoom),
+					}),
+				},
+			},
+			want: want{
+				err: errors.Wrap(errors.Wrap(errBoom, errFetchTags), errFindDependency),
+			},
+		},
+		"ErrorNoValidVersion": {
+			reason: "We should not requeue if valid version does not exist for dependency.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "hasheddan/config-nop-b",
+											Constraints: ">v1.0.0",
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v0.2.0", "v0.3.0", "v1.0.0"}, nil),
+					}),
+				},
+			},
+			want: want{
+				r: reconcile.Result{Requeue: false},
+			},
+		},
+		"ErrorCreateMissingDependency": {
+			reason: "We should return an error if unable to create missing dependency.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockCreate:       test.NewMockCreateFn(errBoom),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "xpkg.crossplane.io/hasheddan/config-nop-c",
+											Constraints: ">v1.0.0",
+											Type:        ptr.To(v1beta1.ConfigurationPackageType),
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v0.2.0", "v0.3.0", "v1.0.0", "v1.2.0"}, nil),
+					}),
+				},
+			},
+			want: want{
+				err: errors.Wrap(errBoom, errCreateDependency),
+			},
+		},
+		"ErrorCreateMissingDependencyWithDigest": {
+			reason: "We should return an error if unable to create missing dependency with digest.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "sha256:ecc25c121431dfc7058754427f97c034ecde26d4aafa0da16d258090e0443904",
+							})
+							return nil
+						}),
+						MockCreate:       test.NewMockCreateFn(errBoom),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "xpkg.crossplane.io/hasheddan/config-nop-c",
+											Constraints: "sha256:ecc25c121431dfc7058754427f97c034ecde26d4aafa0da16d258090e0443904",
+											Type:        ptr.To(v1beta1.ConfigurationPackageType),
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v0.2.0", "v0.3.0", "v1.0.0", "v1.2.0"}, nil),
+					}),
+				},
+			},
+			want: want{
+				err: errors.Wrap(errBoom, errCreateDependency),
+			},
+		},
+		"SuccessfulCreateMissingDependency": {
+			reason: "We should not requeue if able to create missing dependency.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockCreate:       test.NewMockCreateFn(nil),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "xpkg.crossplane.io/hasheddan/config-nop-c",
+											Constraints: ">v1.0.0",
+											Type:        ptr.To(v1beta1.ConfigurationPackageType),
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v0.2.0", "v0.3.0", "v1.0.0", "v1.2.0"}, nil),
+					}),
+				},
+			},
+			want: want{
+				r: reconcile.Result{Requeue: false},
+			},
+		},
+		"SuccessfulCreateMissingDependencyWithRejectedTags": {
+			reason: "We should not requeue if able to create missing dependency.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v1.0.0",
+							})
+							return nil
+						}),
+						MockCreate: test.NewMockCreateFn(nil, func(o client.Object) error {
+							// Make sure the correct tag was selected - v1.0.0,
+							// not v1 or v1.0, which both parse to the same
+							// semver as v1.0.0.
+							p := o.(*unstructured.Unstructured)
+							pkg, err := fieldpath.Pave(p.Object).GetString("spec.package")
+							if err != nil {
+								return err
+							}
+							if pkg != "xpkg.crossplane.io/cool-repo/cool-image:v1.0.0" {
+								return errors.Errorf("incorrect package version selected; want v1.0.0 got %s", pkg)
+							}
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "xpkg.crossplane.io/cool-repo/cool-image",
+											Constraints: "v1.0.0",
+											Type:        ptr.To(v1beta1.ProviderPackageType),
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v1.0.0", "v1", "v1.0", "v1.0.1", "v2.0.0", "v2"}, nil),
+					}),
+				},
+			},
+			want: want{
+				r: reconcile.Result{Requeue: false},
+			},
+		},
+		"SuccessfulCreateMissingDependencyWithRewrite": {
+			reason: "We should not requeue if able to create missing dependency with a rewrite config.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockCreate:       test.NewMockCreateFn(nil),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "xpkg.crossplane.io/hasheddan/config-nop-c",
+											Constraints: ">v1.0.0",
+											Type:        ptr.To(v1beta1.ConfigurationPackageType),
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: func(_ context.Context, _ string, _ ...xpkg.GetOption) ([]string, error) {
+							// Client handles ImageConfig rewriting internally.
+							// This test verifies versions are returned correctly.
+							return []string{"v0.2.0", "v0.3.0", "v1.0.0", "v1.2.0"}, nil
+						},
+					}),
+				},
+			},
+			want: want{
+				r: reconcile.Result{Requeue: false},
+			},
+		},
+		"SuccessfulCreateMissingDependencyWithDigest": {
+			reason: "We should not requeue if able to create missing dependency with digest.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							// Populate package list so we attempt
+							// reconciliation. This is overridden by the mock
+							// DAG.
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockCreate:       test.NewMockCreateFn(nil),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+					},
+				},
+				req: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+				rec: []ReconcilerOption{
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "hasheddan/provider-nop-c",
+											Constraints: "sha256:ecc25c121431dfc7058754427f97c034ecde26d4aafa0da16d258090e0443904",
+											Type:        ptr.To(v1beta1.ProviderPackageType),
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+						}
+					}),
+				},
+			},
+			want: want{
+				r: reconcile.Result{Requeue: false},
+			},
+		},
+		"SuccessfulUpdateDependency": {
+			reason: "We should update the dependency if the flag is enabled and there is a valid version.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+						MockList: test.NewMockListFn(nil, func(obj client.ObjectList) error {
+							p := &unstructured.Unstructured{}
+							p.SetName("this-is-a-cool-image")
+							_ = fieldpath.Pave(p.Object).SetString("spec.package", "xpkg.crossplane.io/cool-repo/cool-image:v0.0.1")
+							l := obj.(*unstructured.UnstructuredList)
+							l.Items = []unstructured.Unstructured{*p}
+							return nil
+						}),
+					},
+				},
+				rec: []ReconcilerOption{
+					WithFeatures(upgradesEnabled),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v0.0.1", "v1.0.0", "v1.0.1", "v2.0.0"}, nil),
+					}),
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "xpkg.crossplane.io/cool-repo/cool-image",
+											Constraints: ">v1.0.0",
+											Type:        ptr.To(v1beta1.ProviderPackageType),
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+							MockGetNode: func(_ string) (dag.Node, error) {
+								return &dag.DependencyNode{
+									Dependency: v1beta1.Dependency{
+										Package: "xpkg.crossplane.io/cool-repo/cool-image",
+										ParentConstraints: []string{
+											">v1.0.0",
+										},
+										Type: ptr.To(v1beta1.ProviderPackageType),
+									},
+								}, nil
+							},
+						}
+					}),
+				},
+			},
+		},
+		"SuccessfulUpdateDependencyWithRewrite": {
+			reason: "We should update the dependency with an image rewrite.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+						MockList: test.NewMockListFn(nil, func(obj client.ObjectList) error {
+							p := &unstructured.Unstructured{}
+							p.SetName("this-is-a-cool-image")
+							// spec.package uses the original ref.
+							_ = fieldpath.Pave(p.Object).SetString("spec.package", "xpkg.crossplane.io/cool-repo/cool-image:v0.0.1")
+							// status.resolvedPackage uses the rewritten ref.
+							_ = fieldpath.Pave(p.Object).SetString("status.resolvedPackage", "registry.example.com/cool-repo/cool-image:v0.0.1")
+							l := obj.(*unstructured.UnstructuredList)
+							l.Items = []unstructured.Unstructured{*p}
+							return nil
+						}),
+					},
+				},
+				rec: []ReconcilerOption{
+					WithFeatures(upgradesEnabled),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v0.0.1", "v1.0.0", "v1.0.1", "v2.0.0"}, nil),
+					}),
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "xpkg.crossplane.io/cool-repo/cool-image",
+											Constraints: ">v1.0.0",
+											Type:        ptr.To(v1beta1.ProviderPackageType),
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+							MockGetNode: func(_ string) (dag.Node, error) {
+								return &dag.DependencyNode{
+									Dependency: v1beta1.Dependency{
+										Package: "xpkg.crossplane.io/cool-repo/cool-image",
+										ParentConstraints: []string{
+											">v1.0.0",
+										},
+										Type: ptr.To(v1beta1.ProviderPackageType),
+									},
+								}, nil
+							},
+						}
+					}),
+				},
+			},
+		},
+		"SuccessfulUpdateDependencyWithDigest": {
+			reason: "We should update the dependency if the flag is enabled and there is a valid digest.",
+			args: args{
+				mgr: &fake.Manager{
+					Client: &test.MockClient{
+						MockGet: test.NewMockGetFn(nil, func(o client.Object) error {
+							l := o.(*v1beta1.Lock)
+							l.Packages = append(l.Packages, v1beta1.LockPackage{
+								Name:    "cool-package",
+								Type:    ptr.To(v1beta1.ProviderPackageType),
+								Source:  "xpkg.crossplane.io/cool-repo/cool-image",
+								Version: "v0.0.1",
+							})
+							return nil
+						}),
+						MockUpdate:       test.NewMockUpdateFn(nil),
+						MockStatusUpdate: test.NewMockSubResourceUpdateFn(nil),
+						MockList: test.NewMockListFn(nil, func(obj client.ObjectList) error {
+							p := &unstructured.Unstructured{}
+							p.SetName("this-is-a-cool-image")
+							_ = fieldpath.Pave(p.Object).SetString("spec.package", "xpkg.crossplane.io/cool-repo/cool-image:v0.0.1")
+							l := obj.(*unstructured.UnstructuredList)
+							l.Items = []unstructured.Unstructured{*p}
+							return nil
+						}),
+					},
+				},
+				rec: []ReconcilerOption{
+					WithFeatures(upgradesEnabled),
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v0.0.1", "v1.0.0", "v1.0.1", "v2.0.0"}, nil),
+					}),
+					WithNewDagFn(func() dag.DAG {
+						return &fakedag.MockDag{
+							MockInit: func(_ []dag.Node) ([]dag.Node, error) {
+								return []dag.Node{
+									&dag.DependencyNode{
+										Dependency: v1beta1.Dependency{
+											Package:     "xpkg.crossplane.io/cool-repo/cool-image",
+											Constraints: ">v1.0.0",
+											Type:        ptr.To(v1beta1.ProviderPackageType),
+										},
+									},
+								}, nil
+							},
+							MockSort: func() ([]string, error) {
+								return nil, nil
+							},
+							MockGetNode: func(_ string) (dag.Node, error) {
+								return &dag.DependencyNode{
+									Dependency: v1beta1.Dependency{
+										Package: "xpkg.crossplane.io/cool-repo/cool-image",
+										ParentConstraints: []string{
+											digest1,
+											digest1,
+										},
+										Type: ptr.To(v1beta1.ProviderPackageType),
+									},
+								}, nil
+							},
+						}
+					}),
+				},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := NewReconciler(tc.args.mgr, append(tc.args.rec, WithLogger(testLog))...)
+
+			got, err := r.Reconcile(context.Background(), reconcile.Request{})
+			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
+				t.Errorf("\n%s\nr.Reconcile(...): -want error, +got error:\n%s", tc.reason, diff)
+			}
+
+			if diff := cmp.Diff(tc.want.r, got, test.EquateErrors()); diff != "" {
+				t.Errorf("\n%s\nr.Reconcile(...): -want, +got:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestFindDigestToUpdate(t *testing.T) {
+	type args struct {
+		node dag.Node
+	}
+
+	type want struct {
+		digest string
+		err    error
+	}
+
+	cases := map[string]struct {
+		reason string
+		args   args
+		want   want
+	}{
+		"AllSameDigests": {
+			reason: "We should be able to find the digest to update.",
+			args: args{
+				node: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package: "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{
+							digest1,
+							digest1,
+						},
+					},
+				},
+			},
+			want: want{
+				digest: digest1,
+			},
+		},
+		"DifferentDigests": {
+			reason: "We should return an error if digests are different.",
+			args: args{
+				node: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package: "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{
+							digest1,
+							digest2,
+						},
+					},
+				},
+			},
+			want: want{
+				err: errors.Errorf(errFmtDiffDigests, fmt.Sprintf("[%s %s]", digest1, digest2)),
+			},
+		},
+		"AllVersions": {
+			reason: "We should return an empty string if all parent constraints are versions.",
+			args: args{
+				node: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package:           "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{"v0.0.1", "v0.0.2"},
+					},
+				},
+			},
+			want: want{
+				digest: "",
+				err:    nil,
+			},
+		},
+		"MixedConstraintTypes": {
+			reason: "We should return an error if both versions and digests are present.",
+			args: args{
+				node: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package: "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{
+							"v0.0.1",
+							digest1,
+						},
+					},
+				},
+			},
+			want: want{
+				err: errors.Errorf(errFmtDiffConstraintTypes, fmt.Sprintf("[v0.0.1 %s]", digest1)),
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := findDigestToUpdate(tc.args.node)
+			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
+				t.Errorf("\n%s\nr.Reconcile(...): -want error, +got error:\n%s", tc.reason, diff)
+			}
+
+			if diff := cmp.Diff(tc.want.digest, got, test.EquateErrors()); diff != "" {
+				t.Errorf("\n%s\nr.Reconcile(...): -want, +got:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestReconcilerFindDependencyVersionToUpgrade(t *testing.T) {
+	type args struct {
+		mgr    manager.Manager
+		insVer string
+		dep    dag.Node
+		rec    []ReconcilerOption
+	}
+
+	type want struct {
+		version string
+		err     error
+	}
+
+	cases := map[string]struct {
+		reason string
+		args   args
+		want   want
+	}{
+		"SuccessReturnDigest": {
+			reason: "We should be able to find the digest to update.",
+			args: args{
+				mgr:    &fake.Manager{Client: test.NewMockClient()},
+				insVer: "v0.0.1",
+				dep: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package: "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{
+							digest1,
+							digest1,
+						},
+					},
+				},
+			},
+			want: want{
+				version: digest1,
+			},
+		},
+		"ErrorMixedParentConstraints": {
+			reason: "We should return an error if parent constraints are mixed.",
+			args: args{
+				mgr:    &fake.Manager{Client: test.NewMockClient()},
+				insVer: "v0.0.1",
+				dep: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package: "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{
+							digest1,
+							"v0.0.1",
+						},
+					},
+				},
+			},
+			want: want{
+				err: errors.Errorf(errFmtDiffConstraintTypes, fmt.Sprintf("[%s v0.0.1]", digest1)),
+			},
+		},
+		"SuccessReturnVersion": {
+			reason: "We should be able to find the version to update.",
+			args: args{
+				mgr:    &fake.Manager{Client: test.NewMockClient()},
+				insVer: "v1.0.0",
+				dep: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package: "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{
+							">=v1.0.0",
+							"v2.0.0",
+						},
+					},
+				},
+				rec: []ReconcilerOption{
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v1.0.0", "v1.0.1", "v2.0.0", "v3.0.0"}, nil),
+					}),
+				},
+			},
+			want: want{
+				version: "v2.0.0",
+			},
+		},
+		"ErrorNoValidVersion": {
+			reason: "We should return an error if no valid version exists for dependency.",
+			args: args{
+				mgr:    &fake.Manager{Client: test.NewMockClient()},
+				insVer: "v1.0.0",
+				dep: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package: "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{
+							">=v1.0.0",
+							"v2.0.0",
+						},
+					},
+				},
+				rec: []ReconcilerOption{
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v1.0.0", "v1.0.1"}, nil),
+					}),
+				},
+			},
+			want: want{
+				err: errors.Errorf(errFmtNoValidVersion, "xpkg.crossplane.io/cool-repo/cool-image", "[>=v1.0.0 v2.0.0]"),
+			},
+		},
+		"ErrorNoValidVersionDowngrade": {
+			reason: "We should return an error if no valid version exists for dependency and downgrade is not enabled.",
+			args: args{
+				mgr:    &fake.Manager{Client: test.NewMockClient()},
+				insVer: "v1.0.0",
+				dep: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package: "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{
+							"<=v1.0.0",
+							"v0.0.1",
+						},
+					},
+				},
+				rec: []ReconcilerOption{
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v0.0.1", "v1.0.0"}, nil),
+					}),
+				},
+			},
+			want: want{
+				err: errors.Errorf(errFmtNoValidVersion, "xpkg.crossplane.io/cool-repo/cool-image", "[<=v1.0.0 v0.0.1]"),
+			},
+		},
+		"UpgradeToSmallestValid": {
+			reason: "We should be able to find the smallest valid version to update to.",
+			args: args{
+				mgr:    &fake.Manager{Client: test.NewMockClient()},
+				insVer: "v2.0.0",
+				dep: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package: "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{
+							">v2.0.0",
+							"<=v3.0.0",
+						},
+					},
+				},
+				rec: []ReconcilerOption{
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v1.0.0", "v2.0.0", "v2.1.0", "v3.0.0"}, nil),
+					}),
+					WithDowngradesEnabled(),
+				},
+			},
+			want: want{
+				version: "v2.1.0",
+			},
+		},
+		"DowngradeToLargestValid": {
+			reason: "We should return an error if no valid version exists for dependency and downgrade is not allowed.",
+			args: args{
+				mgr:    &fake.Manager{Client: test.NewMockClient()},
+				insVer: "v3.0.0",
+				dep: &dag.DependencyNode{
+					Dependency: v1beta1.Dependency{
+						Package: "xpkg.crossplane.io/cool-repo/cool-image",
+						ParentConstraints: []string{
+							">=v0.0.1",
+							"<v3.0.0",
+						},
+					},
+				},
+				rec: []ReconcilerOption{
+					WithClient(&fakexpkg.MockClient{
+						MockListVersions: fakexpkg.NewMockListVersionsFn([]string{"v0.0.1", "v1.0.0", "v2.0.0", "v3.0.0"}, nil),
+					}),
+					WithDowngradesEnabled(),
+				},
+			},
+			want: want{
+				version: "v2.0.0",
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := NewReconciler(tc.args.mgr, append(tc.args.rec, WithLogger(testLog))...)
+			ref, _ := pkgName.ParseReference(tc.args.dep.Identifier())
+
+			got, err := r.findDependencyVersionToUpdate(context.Background(), ref, tc.args.insVer, tc.args.dep, testLog)
+			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
+				t.Errorf("\n%s\nr.findDependencyVersionToUpdate(...): -want error, +got error:\n%s", tc.reason, diff)
+			}
+
+			if diff := cmp.Diff(tc.want.version, got, test.EquateErrors()); diff != "" {
+				t.Errorf("\n%s\nr.findDependencyVersionToUpdate(...): -want, +got:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestPruneOutdatedDependencies(t *testing.T) {
+	type args struct {
+		pkgs []v1beta1.LockPackage
+	}
+
+	type want struct {
+		pkgs []v1beta1.LockPackage
+	}
+
+	cases := map[string]struct {
+		reason string
+		args   args
+		want   want
+	}{
+		"EmptyList": {
+			reason: "An empty package list should return an empty list.",
+			args: args{
+				pkgs: []v1beta1.LockPackage{},
+			},
+			want: want{
+				pkgs: []v1beta1.LockPackage{},
+			},
+		},
+		"OnlyRootPackages": {
+			reason: "All packages should be kept when they are all root packages (no dependencies reference them).",
+			args: args{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root-a",
+						Source:  "example.com/root-a",
+						Version: "v1.0.0",
+					},
+					{
+						Name:    "root-b",
+						Source:  "example.com/root-b",
+						Version: "v2.0.0",
+					},
+				},
+			},
+			want: want{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root-a",
+						Source:  "example.com/root-a",
+						Version: "v1.0.0",
+					},
+					{
+						Name:    "root-b",
+						Source:  "example.com/root-b",
+						Version: "v2.0.0",
+					},
+				},
+			},
+		},
+		"KeepMatchingConstraint": {
+			reason: "Dependencies that match their parent constraints should be kept.",
+			args: args{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root",
+						Source:  "example.com/root",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/dep-a",
+								Constraints: ">=v1.0.0",
+							},
+						},
+					},
+					{
+						Name:    "dep-a",
+						Source:  "example.com/dep-a",
+						Version: "v1.5.0",
+					},
+				},
+			},
+			want: want{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root",
+						Source:  "example.com/root",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/dep-a",
+								Constraints: ">=v1.0.0",
+							},
+						},
+					},
+					{
+						Name:    "dep-a",
+						Source:  "example.com/dep-a",
+						Version: "v1.5.0",
+					},
+				},
+			},
+		},
+		"PruneOutdatedDependency": {
+			reason: "Dependencies that don't match any constraints should be pruned.",
+			args: args{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root",
+						Source:  "example.com/root",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/dep-a",
+								Constraints: ">=v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "dep-a",
+						Source:  "example.com/dep-a",
+						Version: "v1.5.0",
+					},
+				},
+			},
+			want: want{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root",
+						Source:  "example.com/root",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/dep-a",
+								Constraints: ">=v2.0.0",
+							},
+						},
+					},
+				},
+			},
+		},
+		"KeepOneMatchingOutOfMany": {
+			reason: "When multiple packages depend on the same source, keep dependencies matching at least one constraint.",
+			args: args{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root-a",
+						Source:  "example.com/root-a",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/shared",
+								Constraints: ">=v1.0.0",
+							},
+						},
+					},
+					{
+						Name:    "root-b",
+						Source:  "example.com/root-b",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/shared",
+								Constraints: ">=v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "shared",
+						Source:  "example.com/shared",
+						Version: "v1.5.0",
+					},
+				},
+			},
+			want: want{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root-a",
+						Source:  "example.com/root-a",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/shared",
+								Constraints: ">=v1.0.0",
+							},
+						},
+					},
+					{
+						Name:    "root-b",
+						Source:  "example.com/root-b",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/shared",
+								Constraints: ">=v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "shared",
+						Source:  "example.com/shared",
+						Version: "v1.5.0",
+					},
+				},
+			},
+		},
+		"DigestMatchExact": {
+			reason: "Digest versions should be kept only when they exactly match a constraint.",
+			args: args{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root",
+						Source:  "example.com/root",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/dep-digest",
+								Constraints: digest1,
+							},
+						},
+					},
+					{
+						Name:    "dep-digest",
+						Source:  "example.com/dep-digest",
+						Version: digest1,
+					},
+				},
+			},
+			want: want{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root",
+						Source:  "example.com/root",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/dep-digest",
+								Constraints: digest1,
+							},
+						},
+					},
+					{
+						Name:    "dep-digest",
+						Source:  "example.com/dep-digest",
+						Version: digest1,
+					},
+				},
+			},
+		},
+		"DigestNotMatch": {
+			reason: "Digest versions should be pruned when they don't match the constraint.",
+			args: args{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root",
+						Source:  "example.com/root",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/dep-digest",
+								Constraints: digest1,
+							},
+						},
+					},
+					{
+						Name:    "dep-digest",
+						Source:  "example.com/dep-digest",
+						Version: digest2,
+					},
+				},
+			},
+			want: want{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root",
+						Source:  "example.com/root",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/dep-digest",
+								Constraints: digest1,
+							},
+						},
+					},
+				},
+			},
+		},
+		"ComplexDependencyChainNoConflicts": {
+			reason: "In a complex dependency tree with no conflicting constraints, only packages that are roots or match constraints should be kept.",
+			args: args{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root1",
+						Source:  "example.com/root1",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/branch1",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "root2",
+						Source:  "example.com/root2",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/branch2",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "branch1",
+						Source:  "example.com/branch1",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/leaf",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "branch2",
+						Source:  "example.com/branch2",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/leaf",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "leaf",
+						Source:  "example.com/leaf",
+						Version: "v1.5.0",
+					},
+				},
+			},
+			want: want{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root1",
+						Source:  "example.com/root1",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/branch1",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "root2",
+						Source:  "example.com/root2",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/branch2",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "branch1",
+						Source:  "example.com/branch1",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/leaf",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "branch2",
+						Source:  "example.com/branch2",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/leaf",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+				},
+			},
+		},
+		"ComplexDependencyChainConflicts": {
+			reason: "In a complex dependency tree with conflicting constraints, packages matching one conflicting constraint should be kept.",
+			args: args{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root1",
+						Source:  "example.com/root1",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/branch1",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "root2",
+						Source:  "example.com/root2",
+						Version: "v1.5.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/branch2",
+								Constraints: "v1.5.0",
+							},
+						},
+					},
+					{
+						Name:    "branch1",
+						Source:  "example.com/branch1",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/leaf",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "branch2",
+						Source:  "example.com/branch2",
+						Version: "v1.5.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/leaf",
+								Constraints: "v1.5.0",
+							},
+						},
+					},
+					{
+						Name:    "leaf",
+						Source:  "example.com/leaf",
+						Version: "v1.5.0",
+					},
+				},
+			},
+			want: want{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root1",
+						Source:  "example.com/root1",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/branch1",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "root2",
+						Source:  "example.com/root2",
+						Version: "v1.5.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/branch2",
+								Constraints: "v1.5.0",
+							},
+						},
+					},
+					{
+						Name:    "branch1",
+						Source:  "example.com/branch1",
+						Version: "v2.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/leaf",
+								Constraints: "v2.0.0",
+							},
+						},
+					},
+					{
+						Name:    "branch2",
+						Source:  "example.com/branch2",
+						Version: "v1.5.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/leaf",
+								Constraints: "v1.5.0",
+							},
+						},
+					},
+					{
+						Name:    "leaf",
+						Source:  "example.com/leaf",
+						Version: "v1.5.0",
+					},
+				},
+			},
+		},
+		"MixedSemverAndDigest": {
+			reason: "Should handle packages with both semver and digest versions correctly.",
+			args: args{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root",
+						Source:  "example.com/root",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/dep-a",
+								Constraints: ">=v1.0.0",
+							},
+							{
+								Package:     "example.com/dep-b",
+								Constraints: digest1,
+							},
+						},
+					},
+					{
+						Name:    "dep-a",
+						Source:  "example.com/dep-a",
+						Version: "v0.9.0",
+					},
+					{
+						Name:    "dep-b",
+						Source:  "example.com/dep-b",
+						Version: digest2,
+					},
+				},
+			},
+			want: want{
+				pkgs: []v1beta1.LockPackage{
+					{
+						Name:    "root",
+						Source:  "example.com/root",
+						Version: "v1.0.0",
+						Dependencies: []v1beta1.Dependency{
+							{
+								Package:     "example.com/dep-a",
+								Constraints: ">=v1.0.0",
+							},
+							{
+								Package:     "example.com/dep-b",
+								Constraints: digest1,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := pruneOutdatedDependencies(tc.args.pkgs)
+			if diff := cmp.Diff(tc.want.pkgs, got); diff != "" {
+				t.Errorf("\n%s\npruneOutdatedDependencies(...): -want, +got:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}

@@ -1,0 +1,128 @@
+/*
+ * This file is part of the KubeVirt project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Copyright The KubeVirt Authors.
+ *
+ */
+
+package seccomp
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/containers/common/pkg/seccomp"
+)
+
+// Install seccomp, kubeletRoot should be passed in format: /proc/1/root/var/lib/kubelet/
+func InstallPolicy(kubeletRoot string) (retErr error) {
+	const errMsgFormat string = "failed to install default seccomp profile: %v"
+
+	installPath := filepath.Join(kubeletRoot, "seccomp/kubevirt")
+	if err := os.MkdirAll(installPath, 0700); err != nil {
+		return fmt.Errorf(errMsgFormat, err)
+	}
+
+	profileBytes, err := json.Marshal(defaultProfile())
+	if err != nil {
+		return fmt.Errorf(errMsgFormat, fmt.Errorf("internal failure: %v", err))
+	}
+
+	profilePath := filepath.Join(installPath, "kubevirt.json")
+	currentProfileBytes, err := os.ReadFile(profilePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf(errMsgFormat, err)
+	}
+	if bytes.Equal(currentProfileBytes, profileBytes) {
+		// Correct permissions on profiles formerly deployed with a too-permissive mode.
+		if err := os.Chmod(profilePath, 0600); err != nil {
+			return fmt.Errorf(errMsgFormat, err)
+		}
+		return nil
+	}
+
+	// Write to a temp file in the same directory, sync, then rename over the
+	// target. os.Rename is atomic on Linux when source and destination are on
+	// the same filesystem, so readers never see a partial file.
+	tmp, err := os.CreateTemp(installPath, "kubevirt.json.*")
+	if err != nil {
+		return fmt.Errorf(errMsgFormat, err)
+	}
+	defer func() {
+		if err := tmp.Close(); err != nil && retErr == nil {
+			retErr = fmt.Errorf(errMsgFormat, err)
+		}
+		if retErr != nil {
+			if err := os.Remove(tmp.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+				retErr = fmt.Errorf("%w; %v", retErr, err)
+			}
+		}
+	}()
+
+	if _, err := tmp.Write(profileBytes); err != nil {
+		return fmt.Errorf(errMsgFormat, err)
+	}
+	// Ensure data is written to disk before the rename makes it visible.
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf(errMsgFormat, err)
+	}
+	if err := os.Chmod(tmp.Name(), 0600); err != nil {
+		return fmt.Errorf(errMsgFormat, err)
+	}
+	if err := os.Rename(tmp.Name(), profilePath); err != nil {
+		return fmt.Errorf(errMsgFormat, err)
+	}
+	return nil
+}
+
+func defaultProfile() *seccomp.Seccomp {
+	profile := seccomp.DefaultProfile()
+
+	for _, syscalls := range profile.Syscalls {
+		found := -1
+		for i, syscall := range syscalls.Names {
+			// Required for post-copy
+			if syscall == "userfaultfd" {
+				found = i
+				break
+			}
+		}
+		if found == -1 {
+			continue
+		}
+
+		if syscalls.Action == seccomp.ActErrno {
+			names := syscalls.Names[:found]
+			found += 1
+			if found < len(syscalls.Names) {
+				names = append(names, syscalls.Names[found:]...)
+			}
+			syscalls.Names = names
+			break
+		}
+
+	}
+
+	profile.Syscalls = append(profile.Syscalls, &seccomp.Syscall{
+		Names:  []string{"userfaultfd"},
+		Action: seccomp.ActAllow,
+		Args:   []*seccomp.Arg{},
+	})
+	return profile
+}

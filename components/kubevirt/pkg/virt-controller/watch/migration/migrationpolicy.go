@@ -1,0 +1,208 @@
+package migration
+
+import (
+	k8sv1 "k8s.io/api/core/v1"
+
+	k6tv1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/api/migrations/v1alpha1"
+)
+
+type migrationPolicyMatchScore struct {
+	matchingVMILabels int
+	matchingNSLabels  int
+}
+
+func (score migrationPolicyMatchScore) equals(otherScore migrationPolicyMatchScore) bool {
+	return score.matchingVMILabels == otherScore.matchingVMILabels &&
+		score.matchingNSLabels == otherScore.matchingNSLabels
+}
+
+func (score migrationPolicyMatchScore) greaterThan(otherScore migrationPolicyMatchScore) bool {
+	thisTotalScore := score.matchingNSLabels + score.matchingVMILabels
+	otherTotalScore := otherScore.matchingNSLabels + otherScore.matchingVMILabels
+
+	if thisTotalScore == otherTotalScore {
+		return score.matchingVMILabels > otherScore.matchingVMILabels
+	}
+
+	return thisTotalScore > otherTotalScore
+}
+
+func (score migrationPolicyMatchScore) lessThan(otherScore migrationPolicyMatchScore) bool {
+	return !score.equals(otherScore) && !score.greaterThan(otherScore)
+}
+
+// matchPolicy returns the policy that is matched to the vmi, or nil of no policy is matched.
+//
+// Since every policy can specify VMI and Namespace labels to match to, matching is done by returning the most
+// detailed policy, meaning the policy that matches the VMI and specifies the most labels that matched either
+// the VMI or its namespace labels.
+//
+// If two policies are matched and have the same level of details (i.e. same number of matching labels) the matched
+// policy is chosen by policies' names ordered by lexicographic order. The reason is to create a rather arbitrary yet
+// deterministic way of matching policies.
+func matchPolicy(policyList *v1alpha1.MigrationPolicyList, vmi *k6tv1.VirtualMachineInstance, vmiNamespace *k8sv1.Namespace) *v1alpha1.MigrationPolicy {
+	var mathingPolicies []v1alpha1.MigrationPolicy
+	bestScore := migrationPolicyMatchScore{}
+
+	for _, policy := range policyList.Items {
+		doesMatch, curScore := countMatchingLabels(&policy, vmi.Labels, vmiNamespace.Labels)
+
+		if !doesMatch || curScore.lessThan(bestScore) {
+			continue
+		} else if curScore.greaterThan(bestScore) {
+			bestScore = curScore
+			mathingPolicies = []v1alpha1.MigrationPolicy{policy}
+		} else {
+			mathingPolicies = append(mathingPolicies, policy)
+		}
+	}
+
+	if len(mathingPolicies) == 0 {
+		return nil
+	} else if len(mathingPolicies) == 1 {
+		return &mathingPolicies[0]
+	}
+
+	// If more than one policy is matched with the same number of matching labels it will be chosen by policies names'
+	// lexicographic order
+	firstPolicyNameLexicographicOrder := mathingPolicies[0].Name
+	var firstPolicyNameLexicographicOrderIdx int
+
+	for idx, matchingPolicy := range mathingPolicies {
+		if matchingPolicy.Name < firstPolicyNameLexicographicOrder {
+			firstPolicyNameLexicographicOrder = matchingPolicy.Name
+			firstPolicyNameLexicographicOrderIdx = idx
+		}
+	}
+
+	return &mathingPolicies[firstPolicyNameLexicographicOrderIdx]
+}
+
+// countMatchingLabels checks if a policy matches to a VMI and the number of matching labels.
+// In the case that doesMatch is false, matchingLabels needs to be dismissed and not counted on.
+func countMatchingLabels(policy *v1alpha1.MigrationPolicy, vmiLabels, namespaceLabels map[string]string) (doesMatch bool, score migrationPolicyMatchScore) {
+	var matchingVMILabels, matchingNSLabels int
+	doesMatch = true
+
+	if policy.Spec.Selectors == nil {
+		return false, score
+	}
+
+	countLabelsHelper := func(policyLabels, labelsToMatch map[string]string) (matchingLabels int) {
+		for policyKey, policyValue := range policyLabels {
+			value, exists := labelsToMatch[policyKey]
+			if exists && value == policyValue {
+				matchingLabels++
+			} else {
+				doesMatch = false
+				return
+			}
+		}
+		return matchingLabels
+	}
+
+	areSelectorsAndLabelsNotNil := func(selector v1alpha1.LabelSelector, labels map[string]string) bool {
+		return selector != nil && labels != nil
+	}
+
+	if areSelectorsAndLabelsNotNil(policy.Spec.Selectors.VirtualMachineInstanceSelector, vmiLabels) {
+		matchingVMILabels = countLabelsHelper(policy.Spec.Selectors.VirtualMachineInstanceSelector, vmiLabels)
+	}
+
+	if doesMatch && areSelectorsAndLabelsNotNil(policy.Spec.Selectors.NamespaceSelector, vmiLabels) {
+		matchingNSLabels = countLabelsHelper(policy.Spec.Selectors.NamespaceSelector, namespaceLabels)
+	}
+
+	if doesMatch {
+		score = migrationPolicyMatchScore{matchingVMILabels: matchingVMILabels, matchingNSLabels: matchingNSLabels}
+	}
+
+	return doesMatch, score
+}
+
+// applyMigrationPolicySpec merges non-nil policy fields onto base and returns
+// the result without mutating base.
+func applyMigrationPolicySpec(base *k6tv1.VMIMConfigurationOptions, spec *v1alpha1.MigrationPolicySpec) *k6tv1.VMIMConfigurationOptions {
+	result := base.DeepCopy()
+
+	// For backward compatibility, if the policy specifies AllowPostCopy but not AllowWorkloadDisruption,
+	// AllowWorkloadDisruption should follow AllowPostCopy.
+	if spec.AllowWorkloadDisruption == nil && spec.AllowPostCopy != nil {
+		setIfNotNil(&result.AllowWorkloadDisruption, spec.AllowPostCopy)
+	}
+
+	setIfNotNil(&result.AllowAutoConverge, spec.AllowAutoConverge)
+	setIfNotNil(&result.BandwidthPerMigration, spec.BandwidthPerMigration)
+	setIfNotNil(&result.CompletionTimeoutPerGiB, spec.CompletionTimeoutPerGiB)
+	setIfNotNil(&result.MaxDowntimeMs, spec.MaxDowntimeMs)
+	setIfNotNil(&result.AllowPostCopy, spec.AllowPostCopy)
+	setIfNotNil(&result.AllowWorkloadDisruption, spec.AllowWorkloadDisruption)
+	if spec.ExperimentalMigrationOptions != nil {
+		result.ExperimentalMigrationOptions = applyExperimentalMigrationOptions(result.ExperimentalMigrationOptions, spec.ExperimentalMigrationOptions)
+	}
+
+	return result
+}
+
+func applyExperimentalMigrationOptions(base, spec *k6tv1.ExperimentalMigrationOptions) *k6tv1.ExperimentalMigrationOptions {
+	var result *k6tv1.ExperimentalMigrationOptions
+	if base != nil {
+		result = base.DeepCopy()
+	} else {
+		result = &k6tv1.ExperimentalMigrationOptions{}
+	}
+
+	if spec.StallDetector != nil {
+		result.StallDetector = applyStallDetectorOptions(result.StallDetector, spec.StallDetector)
+	}
+	if spec.DowntimeTuning != nil {
+		result.DowntimeTuning = applyDowntimeTuningOptions(result.DowntimeTuning, spec.DowntimeTuning)
+	}
+	setIfNotNil(&result.Compression, spec.Compression)
+
+	return result
+}
+
+func applyDowntimeTuningOptions(base, spec *k6tv1.DowntimeTuningOptions) *k6tv1.DowntimeTuningOptions {
+	var result *k6tv1.DowntimeTuningOptions
+	if base != nil {
+		result = base.DeepCopy()
+	} else {
+		result = &k6tv1.DowntimeTuningOptions{}
+	}
+
+	setIfNotNil(&result.InitialMs, spec.InitialMs)
+	setIfNotNil(&result.Steps, spec.Steps)
+	setIfNotNil(&result.StartAfterIteration, spec.StartAfterIteration)
+	setIfNotNil(&result.CooldownSeconds, spec.CooldownSeconds)
+
+	return result
+}
+
+func applyStallDetectorOptions(base, spec *k6tv1.StallDetectorOptions) *k6tv1.StallDetectorOptions {
+	var result *k6tv1.StallDetectorOptions
+	if base != nil {
+		result = base.DeepCopy()
+	} else {
+		result = &k6tv1.StallDetectorOptions{}
+	}
+
+	setIfNotNil(&result.StallMargin, spec.StallMargin)
+	setIfNotNil(&result.EwmaAlpha, spec.EwmaAlpha)
+	setIfNotNil(&result.StallProgressTimeout, spec.StallProgressTimeout)
+	setIfNotNil(&result.SwitchoverTimeout, spec.SwitchoverTimeout)
+	setIfNotNil(&result.PrecopyPossibleFactor, spec.PrecopyPossibleFactor)
+	setIfNotNil(&result.PatienceWindowDecayFactor, spec.PatienceWindowDecayFactor)
+	setIfNotNil(&result.SearchLocalMinima, spec.SearchLocalMinima)
+	setIfNotNil(&result.CompletionTimeoutFactor, spec.CompletionTimeoutFactor)
+
+	return result
+}
+
+func setIfNotNil[T any](dst **T, src *T) {
+	if src != nil {
+		val := *src
+		*dst = &val
+	}
+}

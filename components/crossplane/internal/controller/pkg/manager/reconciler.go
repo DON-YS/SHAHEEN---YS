@@ -1,0 +1,521 @@
+/*
+Copyright 2020 The Crossplane Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package manager implements the Crossplane Package controllers.
+package manager
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"math"
+	"reflect"
+	"strconv"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/crossplane/crossplane-runtime/v2/pkg/conditions"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/event"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/xpkg"
+
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
+	v1 "github.com/crossplane/crossplane/apis/v2/pkg/v1"
+	"github.com/crossplane/crossplane/apis/v2/pkg/v1beta1"
+	"github.com/crossplane/crossplane/v2/internal/controller/pkg/controller"
+)
+
+const (
+	reconcileTimeout = 1 * time.Minute
+
+	// pullWait is the time after which the package manager will check for
+	// updated content for the given package reference. This behavior is only
+	// enabled when the packagePullPolicy is Always.
+	pullWait = 1 * time.Minute
+
+	reconcilePausedMsg = "Reconciliation (including deletion) is paused via the pause annotation"
+)
+
+func pullBasedRequeue(p *corev1.PullPolicy) reconcile.Result {
+	if p != nil && *p == corev1.PullAlways {
+		return reconcile.Result{RequeueAfter: pullWait}
+	}
+
+	return reconcile.Result{Requeue: false}
+}
+
+const (
+	errGetPackage           = "cannot get package"
+	errListRevisions        = "cannot list revisions for package"
+	errUnpack               = "cannot unpack package"
+	errApplyPackageRevision = "cannot apply package revision"
+	errGCPackageRevision    = "cannot garbage collect old package revision"
+
+	errUpdateStatus                  = "cannot update package status"
+	errUpdateInactivePackageRevision = "cannot update inactive package revision"
+)
+
+// Event reasons.
+const (
+	reasonList               event.Reason = "ListRevision"
+	reasonUnpack             event.Reason = "UnpackPackage"
+	reasonTransitionRevision event.Reason = "TransitionRevision"
+	reasonGarbageCollect     event.Reason = "GarbageCollect"
+	reasonInstall            event.Reason = "InstallPackageRevision"
+	reasonPaused             event.Reason = "ReconciliationPaused"
+)
+
+// ReconcilerOption is used to configure the Reconciler.
+type ReconcilerOption func(*Reconciler)
+
+// WithNewPackageFn determines the type of package being reconciled.
+func WithNewPackageFn(f func() v1.Package) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.newPackage = f
+	}
+}
+
+// packageRevisionID returns the revision identifier used to derive a PackageRevision name.
+func packageRevisionID(digest string, generation int64) string {
+	h := sha256.Sum256([]byte(digest + "|" + strconv.FormatInt(generation, 10)))
+	return hex.EncodeToString(h[:])
+}
+
+// WithNewPackageRevisionFn determines the type of package being reconciled.
+func WithNewPackageRevisionFn(f func() v1.PackageRevision) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.newPackageRevision = f
+	}
+}
+
+// WithNewPackageRevisionListFn determines the type of package being reconciled.
+func WithNewPackageRevisionListFn(f func() v1.PackageRevisionList) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.newPackageRevisionList = f
+	}
+}
+
+// WithClient specifies the package client to use.
+func WithClient(c xpkg.Client) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.pkg = c
+	}
+}
+
+// WithLogger specifies how the Reconciler should log messages.
+func WithLogger(log logging.Logger) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.log = log
+	}
+}
+
+// WithRecorder specifies how the Reconciler should record Kubernetes events.
+func WithRecorder(er event.Recorder) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.record = er
+	}
+}
+
+// WithManagingRevisionRuntimeSpec will allow this reconciler to propagate the
+// runtime spec fields to revisions.
+func WithManagingRevisionRuntimeSpec() ReconcilerOption {
+	return func(r *Reconciler) {
+		r.setPackageRuntimeManagedFields = func(p v1.Package, pr v1.PackageRevision) {
+			pwr, pwok := p.(v1.PackageWithRuntime)
+
+			prwr, prok := pr.(v1.PackageRevisionWithRuntime)
+			if pwok && prok {
+				prwr.SetRuntimeConfigRef(pwr.GetRuntimeConfigRef())
+				prwr.SetTLSServerSecretName(pwr.GetTLSServerSecretName())
+				prwr.SetTLSClientSecretName(pwr.GetTLSClientSecretName())
+			}
+		}
+	}
+}
+
+// Reconciler reconciles packages.
+type Reconciler struct {
+	kube       resource.ClientApplicator
+	pkg        xpkg.Client
+	log        logging.Logger
+	record     event.Recorder
+	conditions conditions.Manager
+
+	setPackageRuntimeManagedFields func(p v1.Package, pr v1.PackageRevision)
+
+	newPackage             func() v1.Package
+	newPackageRevision     func() v1.PackageRevision
+	newPackageRevisionList func() v1.PackageRevisionList
+}
+
+// SetupProvider adds a controller that reconciles Providers.
+func SetupProvider(mgr ctrl.Manager, o controller.Options) error {
+	name := "packages/" + strings.ToLower(v1.ProviderGroupKind)
+	np := func() v1.Package { return &v1.Provider{} }
+	nr := func() v1.PackageRevision { return &v1.ProviderRevision{} }
+	nrl := func() v1.PackageRevisionList { return &v1.ProviderRevisionList{} }
+
+	log := o.Logger.WithValues("controller", name)
+	opts := []ReconcilerOption{
+		WithNewPackageFn(np),
+		WithNewPackageRevisionFn(nr),
+		WithNewPackageRevisionListFn(nrl),
+		WithClient(o.Client),
+		WithLogger(log),
+		WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name), o.EventFilterFunctions...)),
+	}
+
+	if o.PackageRuntime.For(v1.ProviderKind) == controller.PackageRuntimeDeployment {
+		opts = append(opts, WithManagingRevisionRuntimeSpec())
+	}
+
+	return ctrl.NewControllerManagedBy(mgr).
+		Named(name).
+		For(&v1.Provider{}).
+		Owns(&v1.ProviderRevision{}).
+		Watches(&v1beta1.ImageConfig{}, EnqueuePackagesForImageConfig(mgr.GetClient(), &v1.ProviderList{}, log)).
+		WithOptions(o.ForControllerRuntime()).
+		Complete(errors.WithSilentRequeueOnConflict(NewReconciler(mgr, opts...)))
+}
+
+// SetupConfiguration adds a controller that reconciles Configurations.
+func SetupConfiguration(mgr ctrl.Manager, o controller.Options) error {
+	name := "packages/" + strings.ToLower(v1.ConfigurationGroupKind)
+	np := func() v1.Package { return &v1.Configuration{} }
+	nr := func() v1.PackageRevision { return &v1.ConfigurationRevision{} }
+	nrl := func() v1.PackageRevisionList { return &v1.ConfigurationRevisionList{} }
+
+	log := o.Logger.WithValues("controller", name)
+	r := NewReconciler(mgr,
+		WithNewPackageFn(np),
+		WithNewPackageRevisionFn(nr),
+		WithNewPackageRevisionListFn(nrl),
+		WithClient(o.Client),
+		WithLogger(log),
+		WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name), o.EventFilterFunctions...)),
+	)
+
+	return ctrl.NewControllerManagedBy(mgr).
+		Named(name).
+		For(&v1.Configuration{}).
+		Owns(&v1.ConfigurationRevision{}).
+		Watches(&v1beta1.ImageConfig{}, EnqueuePackagesForImageConfig(mgr.GetClient(), &v1.ConfigurationList{}, log)).
+		WithOptions(o.ForControllerRuntime()).
+		Complete(errors.WithSilentRequeueOnConflict(r))
+}
+
+// SetupFunction adds a controller that reconciles Functions.
+func SetupFunction(mgr ctrl.Manager, o controller.Options) error {
+	name := "packages/" + strings.ToLower(v1.FunctionGroupKind)
+	np := func() v1.Package { return &v1.Function{} }
+	nr := func() v1.PackageRevision { return &v1.FunctionRevision{} }
+	nrl := func() v1.PackageRevisionList { return &v1.FunctionRevisionList{} }
+
+	log := o.Logger.WithValues("controller", name)
+	opts := []ReconcilerOption{
+		WithNewPackageFn(np),
+		WithNewPackageRevisionFn(nr),
+		WithNewPackageRevisionListFn(nrl),
+		WithClient(o.Client),
+		WithLogger(log),
+		WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name), o.EventFilterFunctions...)),
+	}
+
+	if o.PackageRuntime.For(v1.FunctionKind) == controller.PackageRuntimeDeployment {
+		opts = append(opts, WithManagingRevisionRuntimeSpec())
+	}
+
+	return ctrl.NewControllerManagedBy(mgr).
+		Named(name).
+		For(&v1.Function{}).
+		Owns(&v1.FunctionRevision{}).
+		Watches(&v1beta1.ImageConfig{}, EnqueuePackagesForImageConfig(mgr.GetClient(), &v1.FunctionList{}, log)).
+		WithOptions(o.ForControllerRuntime()).
+		Complete(errors.WithSilentRequeueOnConflict(NewReconciler(mgr, opts...)))
+}
+
+// NewReconciler creates a new package reconciler.
+func NewReconciler(mgr ctrl.Manager, opts ...ReconcilerOption) *Reconciler {
+	r := &Reconciler{
+		kube: resource.ClientApplicator{
+			Client:     mgr.GetClient(),
+			Applicator: resource.NewAPIPatchingApplicator(mgr.GetClient()),
+		},
+		log:        logging.NewNopLogger(),
+		record:     event.NewNopRecorder(),
+		conditions: conditions.ObservedGenerationPropagationManager{},
+	}
+
+	for _, f := range opts {
+		f(r)
+	}
+
+	return r
+}
+
+// Reconcile package.
+func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) { //nolint:gocognit // Reconcilers are complex. Be wary of adding more.
+	log := r.log.WithValues("request", req)
+	log.Debug("Reconciling")
+
+	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
+
+	p := r.newPackage()
+	if err := r.kube.Get(ctx, req.NamespacedName, p); err != nil {
+		// There's no need to requeue if we no longer exist. Otherwise
+		// we'll be requeued implicitly because we return an error.
+		log.Debug(errGetPackage, "error", err)
+		return reconcile.Result{}, errors.Wrap(resource.IgnoreNotFound(err), errGetPackage)
+	}
+
+	status := r.conditions.For(p)
+
+	// Check the pause annotation and return if it has the value "true"
+	// after logging, publishing an event and updating the SYNC status condition
+	if meta.IsPaused(p) {
+		r.record.Event(p, event.Normal(reasonPaused, reconcilePausedMsg))
+		status.MarkConditions(xpv2.ReconcilePaused().WithMessage(reconcilePausedMsg))
+		// If the pause annotation is removed, we will have a chance to reconcile again and resume
+		// and if status update fails, we will reconcile again to retry to update the status
+		return reconcile.Result{}, errors.Wrap(r.kube.Status().Update(ctx, p), errUpdateStatus)
+	}
+
+	if c := p.GetCondition(xpv2.ReconcilePaused().Type); c.Reason == xpv2.ReconcilePaused().Reason {
+		p.CleanConditions()
+		// Persist the removal of conditions and return. We'll be requeued
+		// with the updated status and resume reconciliation.
+		return reconcile.Result{}, errors.Wrap(r.kube.Status().Update(ctx, p), errUpdateStatus)
+	}
+
+	// Get existing package revisions.
+	prs := r.newPackageRevisionList()
+	if err := r.kube.List(ctx, prs, client.MatchingLabels(map[string]string{v1.LabelParentPackage: p.GetName()})); resource.IgnoreNotFound(err) != nil {
+		err = errors.Wrap(err, errListRevisions)
+		r.record.Event(p, event.Warning(reasonList, err))
+
+		return reconcile.Result{}, err
+	}
+
+	// Don't create or update package revisions while the package is being deleted.
+	// Kubernetes garbage collection owns deletion of controlled package revisions.
+	if meta.WasDeleted(p) {
+		return reconcile.Result{}, nil
+	}
+
+	// Fetch the package to get its digest and any applied ImageConfigs.
+	pkg, err := r.pkg.Get(ctx, p.GetSource(),
+		xpkg.WithPullSecrets(v1.RefNames(p.GetPackagePullSecrets())...),
+		xpkg.WithPullPolicy(ptr.Deref(p.GetPackagePullPolicy(), corev1.PullIfNotPresent)),
+	)
+	if err != nil {
+		err = errors.Wrap(err, errUnpack)
+		status.MarkConditions(v1.Unpacking().WithMessage(err.Error()), v1.Unhealthy().WithMessage(err.Error()))
+		r.record.Event(p, event.Warning(reasonUnpack, err))
+
+		if updateErr := r.kube.Status().Update(ctx, p); updateErr != nil {
+			return reconcile.Result{}, errors.Wrap(updateErr, errUpdateStatus)
+		}
+
+		return reconcile.Result{}, err
+	}
+
+	// Clear previous ImageConfig refs and set the ones that were applied.
+	for _, reason := range xpkg.SupportedImageConfigs() {
+		p.ClearAppliedImageConfigRef(v1.ImageConfigRefReason(reason))
+	}
+
+	for _, cfg := range pkg.AppliedImageConfigs {
+		p.SetAppliedImageConfigRefs(v1.ImageConfigRef{
+			Name:   cfg.Name,
+			Reason: v1.ImageConfigRefReason(cfg.Reason),
+		})
+	}
+
+	p.SetResolvedSource(pkg.ResolvedRef())
+
+	// Calculate the revision ID from the package digest and package generation.
+	revisionID := packageRevisionID(pkg.DigestHex(), p.GetGeneration())
+
+	revisionName := xpkg.FriendlyID(p.GetName(), revisionID)
+
+	// Set the current revision and identifier.
+	p.SetCurrentRevision(revisionName)
+	// Use the original source as the identifier, even if it was rewritten by
+	// ImageConfig. The revisioning and dependency resolution logic are all
+	// based on the original package sources, so it's important that we preserve
+	// the original until it's time to actually pull an image.
+	p.SetCurrentIdentifier(p.GetSource())
+
+	pr := r.newPackageRevision()
+	maxRevision := int64(0)
+	oldestRevision := int64(math.MaxInt64)
+	oldestRevisionIndex := -1
+	revisions := prs.GetRevisions()
+
+	// Check to see if revision already exists.
+	for index, rev := range revisions {
+		revisionNum := rev.GetRevision()
+
+		// Set max revision to the highest numbered existing revision.
+		if revisionNum > maxRevision {
+			maxRevision = revisionNum
+		}
+
+		// Set oldest revision to the lowest numbered revision and
+		// record its index.
+		if revisionNum < oldestRevision {
+			oldestRevision = revisionNum
+			oldestRevisionIndex = index
+		}
+		// If revision name is same as current revision, then revision
+		// already exists.
+		if rev.GetName() == p.GetCurrentRevision() {
+			pr = rev
+			// Finish iterating through all revisions to make sure
+			// all non-current revisions are inactive.
+			continue
+		}
+
+		if rev.GetDesiredState() == v1.PackageRevisionActive {
+			// If revision is not the current revision, set to
+			// inactive. This should always be done, regardless of
+			// the package's revision activation policy.
+			rev.SetDesiredState(v1.PackageRevisionInactive)
+
+			if err := r.kube.Applicator.Apply(ctx, rev, resource.MustBeControllableBy(p.GetUID())); err != nil {
+				if kerrors.IsConflict(err) {
+					return reconcile.Result{Requeue: true}, nil
+				}
+
+				err = errors.Wrap(err, errUpdateInactivePackageRevision)
+				r.record.Event(p, event.Warning(reasonTransitionRevision, err))
+
+				return reconcile.Result{}, err
+			}
+		}
+	}
+
+	// The current revision should always be the highest numbered revision.
+	if pr.GetRevision() < maxRevision || maxRevision == 0 {
+		pr.SetRevision(maxRevision + 1)
+	}
+
+	// Check to see if there are revisions eligible for garbage collection.
+	if p.GetRevisionHistoryLimit() != nil &&
+		*p.GetRevisionHistoryLimit() != 0 &&
+		len(revisions) > (int(*p.GetRevisionHistoryLimit())+1) {
+		gcRev := revisions[oldestRevisionIndex]
+		// Find the oldest revision and delete it.
+		if err := r.kube.Delete(ctx, gcRev); err != nil {
+			err = errors.Wrap(err, errGCPackageRevision)
+			r.record.Event(p, event.Warning(reasonGarbageCollect, err))
+
+			return reconcile.Result{}, err
+		}
+	}
+
+	health := v1.PackageHealth(pr)
+	if health.Status == corev1.ConditionTrue && p.GetCondition(v1.TypeHealthy).Status != corev1.ConditionTrue {
+		// NOTE(phisco): We don't want to spam the user with events if the
+		// package is already healthy.
+		r.record.Event(p, event.Normal(reasonInstall, "Successfully installed package revision"))
+	}
+
+	status.MarkConditions(health)
+
+	// Create the non-existent package revision.
+	pr.SetName(revisionName)
+	pr.SetLabels(map[string]string{v1.LabelParentPackage: p.GetName()})
+	// Use the original source; the revision reconciler will rewrite it if
+	// needed. The revision reconciler also inserts packages into the dependency
+	// manager's lock, which must use the original source to ensure dependency
+	// packages have the expected names even when rewritten.
+	pr.SetSource(p.GetSource())
+	pr.SetPackagePullPolicy(p.GetPackagePullPolicy())
+	pr.SetPackagePullSecrets(p.GetPackagePullSecrets())
+	pr.SetIgnoreCrossplaneConstraints(p.GetIgnoreCrossplaneConstraints())
+	pr.SetSkipDependencyResolution(p.GetSkipDependencyResolution())
+	pr.SetCommonLabels(p.GetCommonLabels())
+	pr.SetCommonAnnotations(p.GetCommonAnnotations())
+
+	if r.setPackageRuntimeManagedFields != nil {
+		r.setPackageRuntimeManagedFields(p, pr)
+	}
+
+	// If the current revision is not active, and we have an automatic or
+	// undefined activation policy, always activate.
+	if pr.GetDesiredState() != v1.PackageRevisionActive && (p.GetActivationPolicy() == nil || *p.GetActivationPolicy() == v1.AutomaticActivation) {
+		pr.SetDesiredState(v1.PackageRevisionActive)
+	}
+
+	controlRef := meta.AsController(meta.TypedReferenceTo(p, p.GetObjectKind().GroupVersionKind()))
+	controlRef.BlockOwnerDeletion = new(true)
+	meta.AddOwnerReference(pr, controlRef)
+
+	if err := r.kube.Applicator.Apply(ctx, pr, resource.MustBeControllableBy(p.GetUID())); err != nil {
+		if kerrors.IsConflict(err) {
+			return reconcile.Result{Requeue: true}, nil
+		}
+
+		err = errors.Wrap(err, errApplyPackageRevision)
+		r.record.Event(p, event.Warning(reasonInstall, err))
+
+		return reconcile.Result{}, err
+	}
+
+	// Handle changes in labels or annotations
+	sameLabels := reflect.DeepEqual(pr.GetCommonLabels(), p.GetCommonLabels())
+	sameAnnotations := reflect.DeepEqual(pr.GetCommonAnnotations(), p.GetCommonAnnotations())
+	if !sameLabels || !sameAnnotations {
+		pr.SetCommonLabels(p.GetCommonLabels())
+		pr.SetCommonAnnotations(p.GetCommonAnnotations())
+
+		if err := r.kube.Update(ctx, pr); err != nil {
+			if kerrors.IsConflict(err) {
+				return reconcile.Result{Requeue: true}, nil
+			}
+
+			err = errors.Wrap(err, errApplyPackageRevision)
+			r.record.Event(p, event.Warning(reasonInstall, err))
+
+			return reconcile.Result{}, err
+		}
+	}
+
+	status.MarkConditions(v1.Active())
+
+	// If current revision is still not active, the package is inactive.
+	if pr.GetDesiredState() != v1.PackageRevisionActive {
+		status.MarkConditions(v1.Inactive().WithMessage("Package is inactive"))
+	}
+
+	// NOTE(hasheddan): when the first package revision is created for a
+	// package, the health of the package is not set until the revision reports
+	// its health. If updating from an existing revision, the package health
+	// will match the health of the old revision until the next reconcile.
+	return pullBasedRequeue(p.GetPackagePullPolicy()), errors.Wrap(r.kube.Status().Update(ctx, p), errUpdateStatus)
+}

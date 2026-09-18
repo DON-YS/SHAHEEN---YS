@@ -1,0 +1,74 @@
+load("@rules_img//img:image.bzl", "image_manifest")
+load("@rules_img//img:layer.bzl", "layer_from_tar")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+
+pkg_tar(
+    name = "multipath",
+    srcs = [":multipath.conf"],
+    mode = "0600",
+    package_dir = "/etc",
+)
+
+pkg_tar(
+    name = "get-version",
+    srcs = ["//:get-version"],
+    package_dir = "/",
+)
+
+pkg_tar(
+    name = "entrypoint",
+    srcs = [":entrypoint.sh"],
+    mode = "0700",
+    package_dir = "/",
+)
+
+layer_from_tar(
+    name = "multipath-layer",
+    src = ":multipath",
+)
+
+layer_from_tar(
+    name = "entrypoint-layer",
+    src = ":entrypoint",
+)
+
+layer_from_tar(
+    name = "get-version-layer",
+    src = ":get-version",
+)
+
+layer_from_tar(
+    name = "pr-helper-rpm-layer-x86_64",
+    src = "//rpm:pr-helper_x86_64",
+)
+
+layer_from_tar(
+    name = "pr-helper-rpm-layer-aarch64",
+    src = "//rpm:pr-helper_aarch64",
+)
+
+image_manifest(
+    name = "version-container",
+    base = "//:passwd-image",
+    layers = select({
+        "@io_bazel_rules_go//go/platform:linux_arm64": [
+            ":multipath-layer",
+            ":entrypoint-layer",
+            ":pr-helper-rpm-layer-aarch64",
+            ":get-version-layer",
+        ],
+        "//conditions:default": [
+            ":multipath-layer",
+            ":entrypoint-layer",
+            ":pr-helper-rpm-layer-x86_64",
+            ":get-version-layer",
+        ],
+    }),
+)
+
+image_manifest(
+    name = "pr-helper-image",
+    base = ":version-container",
+    entrypoint = ["/usr/bin/qemu-pr-helper"],
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,26 @@
+package definition
+
+import (
+	"slices"
+
+	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+
+	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/xcrd"
+)
+
+// IsCompositeResourceCRD accepts any CustomResourceDefinition that represents a
+// Composite Resource.
+//
+//nolint:staticcheck // TODO(adamwg) Stop using resource.PredicateFn after the v2.2 release.
+func IsCompositeResourceCRD() resource.PredicateFn {
+	return func(obj runtime.Object) bool {
+		crd, ok := obj.(*extv1.CustomResourceDefinition)
+		if !ok {
+			return false
+		}
+
+		return slices.Contains(crd.Spec.Names.Categories, xcrd.CategoryComposite)
+	}
+}

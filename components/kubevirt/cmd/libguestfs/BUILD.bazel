@@ -1,0 +1,110 @@
+load("@rules_img//img:image.bzl", "image_manifest")
+load("@rules_img//img:layer.bzl", "layer_from_tar")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+
+pkg_tar(
+    name = "entrypoint",
+    srcs = ["entrypoint.sh"],
+    mode = "0775",
+    package_dir = "/",
+)
+
+# Create done file. This was used in the previous version of the image to understand when the appliance was extracted.
+genrule(
+    name = "done-file",
+    outs = ["done"],
+    cmd = "touch $@",
+)
+
+pkg_tar(
+    name = "version",
+    srcs = [
+        "//:get-version",
+    ],
+    package_dir = "/",
+)
+
+pkg_tar(
+    name = "appliance_layer_x86_64",
+    srcs = [
+        ":done-file",
+        "@libguestfs-appliance-x86_64//appliance:README.fixed",
+        "@libguestfs-appliance-x86_64//appliance:initrd",
+        "@libguestfs-appliance-x86_64//appliance:kernel",
+        "@libguestfs-appliance-x86_64//appliance:root",
+    ],
+    mode = "0444",
+    package_dir = "/usr/local/lib/guestfs/appliance",
+    visibility = ["//visibility:public"],
+)
+
+pkg_tar(
+    name = "appliance_layer_s390x",
+    srcs = [
+        ":done-file",
+        "@libguestfs-appliance-s390x//appliance:README.fixed",
+        "@libguestfs-appliance-s390x//appliance:initrd",
+        "@libguestfs-appliance-s390x//appliance:kernel",
+        "@libguestfs-appliance-s390x//appliance:root",
+    ],
+    mode = "0444",
+    package_dir = "/usr/local/lib/guestfs/appliance",
+    visibility = ["//visibility:public"],
+)
+
+layer_from_tar(
+    name = "version-layer",
+    src = ":version",
+)
+
+layer_from_tar(
+    name = "entrypoint-layer",
+    src = ":entrypoint",
+)
+
+layer_from_tar(
+    name = "appliance-layer-x86_64",
+    src = ":appliance_layer_x86_64",
+)
+
+layer_from_tar(
+    name = "appliance-layer-s390x",
+    src = ":appliance_layer_s390x",
+)
+
+layer_from_tar(
+    name = "libguestfs-tools-rpm-layer-x86_64",
+    src = "//rpm:libguestfs-tools_x86_64",
+)
+
+layer_from_tar(
+    name = "libguestfs-tools-rpm-layer-s390x",
+    src = "//rpm:libguestfs-tools_s390x",
+)
+
+image_manifest(
+    name = "version-container",
+    base = "//:passwd-image",
+    layers = [
+        ":version-layer",
+    ],
+)
+
+image_manifest(
+    name = "libguestfs-tools-image",
+    base = ":version-container",
+    entrypoint = ["/entrypoint.sh"],
+    layers = select({
+        "@io_bazel_rules_go//go/platform:linux_s390x": [
+            ":appliance-layer-s390x",
+            ":libguestfs-tools-rpm-layer-s390x",
+            ":entrypoint-layer",
+        ],
+        "//conditions:default": [
+            ":appliance-layer-x86_64",
+            ":libguestfs-tools-rpm-layer-x86_64",
+            ":entrypoint-layer",
+        ],
+    }),
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,372 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  # We can't run a step 'if secrets.FOO != ""' but we can run a step
+  # 'if env.FOO' != ""', so we copy secrets to env vars for conditional checks.
+  DOCKER_USR: ${{ secrets.DOCKER_USR }}
+  UPBOUND_MARKETPLACE_PUSH_ROBOT_USR: ${{ secrets.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR }}
+  AWS_USR: ${{ secrets.AWS_USR }}
+
+jobs:
+  check-diff:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: crossplane
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Verify Generated Code
+        run: nix build .#checks.x86_64-linux.generate .#checks.x86_64-linux.generate-apis --print-build-logs
+
+      - name: Check Diff
+        run: |
+          nix run .#tidy
+          echo "Checking that branch is clean..."
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --short
+            echo "ERROR: go.mod/go.sum or vendor hashes are out of date. Run 'nix run .#tidy' and commit."
+            exit 1
+          fi
+
+  lint:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: crossplane
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Lint
+        run: nix build .#checks.x86_64-linux.go-lint .#checks.x86_64-linux.go-lint-apis .#checks.x86_64-linux.helm-lint --print-build-logs
+
+  codeql:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: crossplane
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Setup Nix Environment
+        uses: nicknovitski/nix-develop@9be7cfb4b10451d3390a75dc18ad0465bed4932a # v1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@d1ba80a13dd99fba24a470575428917156a28b43 # v4
+        with:
+          languages: go
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@d1ba80a13dd99fba24a470575428917156a28b43 # v4
+
+  unit-tests:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: crossplane
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Run Unit Tests
+        run: nix build .#checks.x86_64-linux.test .#checks.x86_64-linux.test-apis --print-build-logs
+
+      - name: Publish Unit Test Coverage
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          flags: unittests
+          file: result/coverage.txt
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # E2E tests run outside the Nix sandbox (needs Docker)
+  e2e-tests:
+    runs-on: ubuntu-24.04
+    env:
+      # Resolved here because the secrets context isn't available in a
+      # step-level if. Empty on pull requests from forks, which don't receive
+      # secrets, and on forks of this repository.
+      BUILDPULSE_CONFIGURED: ${{ secrets.BUILDPULSE_ACCESS_KEY_ID != '' && secrets.BUILDPULSE_SECRET_ACCESS_KEY != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        test-area:
+          - apiextensions
+          - apiextensions-legacy
+          - pkg
+          - protection
+          - lifecycle
+
+        test-suite:
+          - base
+
+        include:
+          - test-area: apiextensions
+            test-suite: function-response-cache
+          - test-area: apiextensions-legacy
+            test-suite: function-response-cache
+          - test-area: pkg
+            test-suite: package-dependency-updates
+          - test-area: pkg
+            test-suite: package-signature-verification
+          - test-area: ops
+            test-suite: ops
+          - test-area: mrap
+            test-suite: mrap
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: crossplane
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Set CROSSPLANE_PRIOR_VERSION
+        if: startsWith(github.ref, 'refs/heads/release-') || startsWith(github.base_ref, 'release-')
+        run: |
+          if [[ "${GITHUB_REF}" == refs/heads/release-* ]]; then
+            VERSION=${GITHUB_REF#refs/heads/release-}
+          elif [[ "${GITHUB_BASE_REF}" == release-* ]]; then
+            VERSION=${GITHUB_BASE_REF#release-}
+          fi
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          if [[ "$MINOR" -gt 0 ]]; then
+            MINOR=$((MINOR - 1))
+          else
+            echo "Error: Minor version cannot be decremented below 0"
+            exit 1
+          fi
+          echo "CROSSPLANE_PRIOR_VERSION=$MAJOR.$MINOR" >> "$GITHUB_ENV"
+
+      - name: Run E2E Tests
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          command: |
+            nix run .#e2e -- \
+              -test.failfast \
+              -fail-fast \
+              -prior-crossplane-version=${CROSSPLANE_PRIOR_VERSION} \
+              --test-suite ${{ matrix.test-suite }} \
+              -labels area=${{ matrix.test-area }}
+
+      - name: Publish E2E Test Flakes
+        if: "!cancelled() && env.BUILDPULSE_CONFIGURED == 'true'"
+        uses: buildpulse/buildpulse-action@76dbedc6585e8731b40a19da1ebc3f6609dbbb83 # v3
+        with:
+          account: 45158470
+          repository: 147886080
+          key: ${{ secrets.BUILDPULSE_ACCESS_KEY_ID }}
+          secret: ${{ secrets.BUILDPULSE_SECRET_ACCESS_KEY }}
+          path: ${{ runner.temp }}/e2e-tests.xml
+
+      - name: Upload E2E Test Artifacts
+        if: '!cancelled()'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-tests-${{ matrix.test-area }}-${{ matrix.test-suite }}
+          path: ${{ runner.temp }}/e2e-tests.xml
+
+  # Build all artifacts (binaries, images, Helm chart)
+  build-artifacts:
+    permissions:
+      contents: read
+      packages: write  # for pushing to ghcr.io
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Cleanup Disk
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          tool-cache: true
+          swap-storage: false
+          large-packages: false
+          docker-images: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: crossplane
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      # Set buildVersion in flake.nix. The version is an input to the build.
+      # Pure (sandboxed, reproducible) Nix build inputs can only come from git
+      # tracked files, so we set it in flake.nix before building.
+      - name: Set Version
+        run: |
+          VERSION=$(git describe --dirty --always --tags --match 'v[0-9]*' | sed 's/-/./2g')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          sed -i "s|buildVersion = null;|buildVersion = \"$VERSION\";|" flake.nix
+
+      - name: Build Artifacts
+        run: nix build --option warn-dirty false --print-build-logs
+
+      - name: Validate Artifacts
+        run: |
+          for f in $(find result/bin/ -type f -not -name '*.sha256'); do
+            want=$(sha256sum "${f}" | head -c 64)
+            got=$(cat "${f}.sha256")
+            if [[ "${want}" != "${got}" ]]; then
+              echo "File ${f} has incorrect checksum; want ${want}, got ${got}"
+              exit 1
+            fi
+          done
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: output
+          path: result/**
+
+      - name: Login to DockerHub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        if: env.DOCKER_USR != ''
+        with:
+          username: ${{ secrets.DOCKER_USR }}
+          password: ${{ secrets.DOCKER_PSW }}
+
+      - name: Login to Upbound
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        if: env.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR != ''
+        with:
+          registry: xpkg.upbound.io
+          username: ${{ secrets.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR }}
+          password: ${{ secrets.UPBOUND_MARKETPLACE_PUSH_ROBOT_PSW }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Images to DockerHub
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-')) && env.DOCKER_USR != ''
+        run: nix run --option warn-dirty false .#push-images -- crossplane/crossplane
+
+      - name: Push Images to Upbound
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-')) && env.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR != ''
+        run: nix run --option warn-dirty false .#push-images -- xpkg.upbound.io/crossplane/crossplane
+
+      - name: Push Images to GitHub Container Registry
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-')
+        run: nix run --option warn-dirty false .#push-images -- ghcr.io/crossplane/crossplane
+
+      - name: Push Artifacts to S3
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-')) && env.AWS_USR != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_USR }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_PSW }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: nix run --option warn-dirty false .#push-artifacts -- "${GITHUB_REF##*/}"
+
+      - name: Promote Artifacts to Master Channel
+        if: github.ref == 'refs/heads/main' && env.AWS_USR != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_USR }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_PSW }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: nix run --option warn-dirty false .#promote-artifacts -- main "$VERSION" master
+
+  # Fuzz testing (unchanged from original)
+  fuzz-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Build Fuzzers
+        id: build
+        uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master
+        with:
+          oss-fuzz-project-name: "crossplane"
+          language: go
+
+      - name: Run Fuzzers
+        uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
+        with:
+          oss-fuzz-project-name: "crossplane"
+          fuzz-seconds: 300
+          language: go
+
+      - name: Upload Crash
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: failure() && steps.build.outcome == 'success'
+        with:
+          name: artifacts
+          path: ./out/artifacts
+
+  # Protobuf schema linting (unchanged from original)
+  protobuf-schemas:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Lint and Push Protocol Buffers
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1
+        with:
+          token: ${{ secrets.BUF_TOKEN }}
+          pr_comment: false
