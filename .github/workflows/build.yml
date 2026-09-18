@@ -1,0 +1,58 @@
+name: Build SHAHEEN-YS
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-crossplane:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build Crossplane
+        run: |
+          cd components/crossplane
+          make build
+
+      - name: Upload Crossplane Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: crossplane-binary
+          path: components/crossplane/_output/bin/
+
+  build-kubevirt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvirt-dev qemu-kvm libvirt-daemon-system
+
+      - name: Build KubeVirt
+        run: |
+          cd components/kubevirt
+          make
+
+      - name: Upload KubeVirt Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubevirt-binary
+          path: components/kubevirt/_out/cmd/
