@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#05060f">
+<title>Login | SHAHEEN - YS</title>
+<link rel="icon" href="img/shaheen-logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/glass.css">
+<link rel="stylesheet" href="css/animations.css">
+<style>
+body{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;position:relative}
+.bg-image{position:fixed;inset:0;background:url('img/login-bg.jpg') center/cover no-repeat;opacity:.18;z-index:-3;filter:blur(2px) saturate(140%)}
+.auth-wrap{display:grid;grid-template-columns:1fr 1fr;max-width:1100px;width:100%;border-radius:28px;overflow:hidden;background:rgba(20,24,45,.55);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);border:1px solid rgba(255,255,255,.12);box-shadow:0 20px 60px rgba(0,0,0,.6);animation:fadeInUp .8s ease both}
+.auth-visual{padding:60px 40px;background:linear-gradient(135deg,rgba(0,212,255,.12),rgba(123,47,247,.12)),rgba(0,0,0,.3);display:flex;flex-direction:column;justify-content:space-between;position:relative;overflow:hidden;min-height:600px}
+.auth-visual::before{content:'';position:absolute;inset:-50%;background:conic-gradient(from 0deg,transparent,rgba(0,212,255,.15),transparent 30%);animation:rotateRing 15s linear infinite;z-index:0}
+.auth-visual>*{position:relative;z-index:1}
+.brand-logo{display:flex;align-items:center;gap:14px}
+.brand-logo img{width:56px;height:56px;border-radius:50%;filter:drop-shadow(0 0 20px rgba(0,212,255,.5))}
+.brand-name{font-size:22px;font-weight:800;letter-spacing:-.5px}
+.brand-sub{font-size:11px;color:var(--text-muted);letter-spacing:2px;text-transform:uppercase;margin-top:2px}
+.auth-hero{margin:40px 0}
+.auth-hero h2{font-size:2rem;margin-bottom:16px;line-height:1.2}
+.auth-hero p{color:var(--text-secondary);font-size:15px;line-height:1.7}
+.auth-features{display:flex;flex-direction:column;gap:12px}
+.feature-item{display:flex;align-items:center;gap:10px;font-size:14px;color:var(--text-secondary)}
+.feature-item .dot{width:6px;height:6px;border-radius:50%;background:var(--shaheen-accent);box-shadow:0 0 8px var(--shaheen-accent);flex-shrink:0}
+.auth-form-wrap{padding:60px 48px;display:flex;flex-direction:column;justify-content:center}
+.auth-tabs{display:flex;gap:4px;background:var(--glass-bg);border:1px solid var(--glass-border);border-radius:14px;padding:4px;margin-bottom:32px}
+.auth-tab{flex:1;padding:10px;text-align:center;font-size:14px;font-weight:600;color:var(--text-muted);border-radius:10px;cursor:pointer;transition:all .3s;user-select:none;background:transparent;border:none;font-family:inherit}
+.auth-tab.active{background:rgba(0,212,255,.15);color:var(--shaheen-primary)}
+.auth-title{font-size:1.75rem;font-weight:700;margin-bottom:8px}
+.auth-subtitle{color:var(--text-secondary);font-size:14px;margin-bottom:32px}
+.form-error{background:rgba(255,59,92,.1);border:1px solid rgba(255,59,92,.3);border-radius:10px;padding:12px 16px;color:#ff8a9e;font-size:13px;margin-bottom:18px;display:none}
+.form-error.show{display:block;animation:fadeIn .3s}
+.divider{display:flex;align-items:center;gap:12px;margin:28px 0;color:var(--text-muted);font-size:12px;letter-spacing:2px}
+.divider::before,.divider::after{content:'';flex:1;height:1px;background:var(--glass-border)}
+.oauth-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.oauth-btn{padding:12px;display:flex;align-items:center;justify-content:center;gap:8px;font-size:13px;font-weight:600}
+.back-link{text-align:center;margin-top:24px;font-size:13px;color:var(--text-muted)}
+.back-link a{color:var(--shaheen-primary);text-decoration:none;font-weight:600}
+@media(max-width:900px){.auth-wrap{grid-template-columns:1fr}.auth-visual{display:none}.auth-form-wrap{padding:40px 28px}}
+</style>
+</head>
+<body>
+<div class="bg-image"></div>
+<div class="auth-wrap">
+<div class="auth-visual">
+<div class="brand-logo">
+<img src="img/shaheen-logo.png" alt="SHAHEEN - YS">
+<div><div class="brand-name">SHAHEEN - YS</div><div class="brand-sub">Cloud Platform</div></div>
+</div>
+<div class="auth-hero">
+<h2>Welcome to<br><span class="text-gradient">The Future of Cloud</span></h2>
+<p>Manage your infrastructure declaratively. Deploy VMs, containers, and networks with unprecedented control and security.</p>
+</div>
+<div class="auth-features">
+<div class="feature-item"><span class="dot"></span> Crossplane Control Plane</div>
+<div class="feature-item"><span class="dot"></span> KubeVirt VM Engine</div>
+<div class="feature-item"><span class="dot"></span> Enterprise Security</div>
+<div class="feature-item"><span class="dot"></span> Real-time Monitoring</div>
+</div>
+</div>
+<div class="auth-form-wrap">
+<h1 class="auth-title" id="formTitle">Sign In</h1>
+<p class="auth-subtitle" id="formSubtitle">Access your SHAHEEN-YS dashboard</p>
+<div class="auth-tabs">
+<button class="auth-tab active" data-mode="login">Sign In</button>
+<button class="auth-tab" data-mode="register">Create Account</button>
+</div>
+<div class="form-error" id="formError"></div>
+<form id="authForm">
+<div class="input-group hidden" id="nameGroup">
+<label for="name">Full Name</label>
+<input type="text" id="name" name="name" class="input" placeholder="Yousef Shaheen" autocomplete="name">
+</div>
+<div class="input-group">
+<label for="email">Email Address</label>
+<input type="email" id="email" name="email" class="input" placeholder="you@example.com" required autocomplete="email">
+</div>
+<div class="input-group">
+<label for="password">Password</label>
+<input type="password" id="password" name="password" class="input" placeholder="••••••••••••" required autocomplete="current-password">
+</div>
+<button type="submit" class="btn btn-primary btn-full" id="submitBtn">
+<span id="submitText">Sign In</span>
+<span class="spinner hidden" id="submitSpinner"></span>
+</button>
+</form>
+<div class="divider">OR CONTINUE WITH</div>
+<div class="oauth-grid">
+<button class="btn btn-glass oauth-btn" disabled title="Coming in Phase 3"><span>🔵</span> Google</button>
+<button class="btn btn-glass oauth-btn" disabled title="Coming in Phase 3"><span>⚫</span> GitHub</button>
+</div>
+<div class="back-link"><a href="index.html">← Back to home</a></div>
+</div>
+</div>
+<script src="js/api.js"></script>
+<script>
+let mode='login';
+document.querySelectorAll('.auth-tab').forEach(tab=>{tab.addEventListener('click',()=>{mode=tab.dataset.mode;document.querySelectorAll('.auth-tab').forEach(t=>t.classList.remove('active'));tab.classList.add('active');const l=mode==='login';document.getElementById('formTitle').textContent=l?'Sign In':'Create Account';document.getElementById('formSubtitle').textContent=l?'Access your SHAHEEN-YS dashboard':'Start your cloud journey today';document.getElementById('submitText').textContent=l?'Sign In':'Create Account';document.getElementById('nameGroup').classList.toggle('hidden',l);document.getElementById('password').setAttribute('autocomplete',l?'current-password':'new-password');hideError();});});
+function showError(m){const el=document.getElementById('formError');el.textContent=m;el.classList.add('show');}
+function hideError(){document.getElementById('formError').classList.remove('show');}
+function setLoading(l){document.getElementById('submitBtn').disabled=l;document.getElementById('submitSpinner').classList.toggle('hidden',!l);}
+document.getElementById('authForm').addEventListener('submit',async e=>{e.preventDefault();hideError();setLoading(true);const email=document.getElementById('email').value.trim();const password=document.getElementById('password').value;const name=document.getElementById('name').value.trim();try{if(mode==='login'){const r=await API.login(email,password);Storage.setUser(r.user);Toast.success(`Welcome back, ${r.user.name}!`);setTimeout(()=>window.location.href='dashboard.html',600);}else{if(!name||name.length<2)throw new Error('Please enter your full name');if(password.length<12)throw new Error('Password must be at least 12 characters');const r=await API.register(email,password,name);Toast.success('Account created! You can now sign in.');setTimeout(()=>{document.querySelector('.auth-tab[data-mode="login"]').click();document.getElementById('password').value='';},800);}}catch(err){showError(err.message||'Something went wrong');setLoading(false);}});
+if(Storage.getUser())window.location.href='dashboard.html';
+</script>
+</body>
+</html>

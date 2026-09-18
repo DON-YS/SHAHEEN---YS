@@ -1,0 +1,13 @@
+@keyframes fadeInUp{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}
+.fade-in-up{animation:fadeInUp .8s cubic-bezier(.4,0,.2,1) both}
+.delay-1{animation-delay:.1s}.delay-2{animation-delay:.2s}.delay-3{animation-delay:.3s}.delay-4{animation-delay:.4s}.delay-5{animation-delay:.5s}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.fade-in{animation:fadeIn 1s ease both}
+@keyframes logoBreath{0%,100%{transform:scale(1);filter:drop-shadow(0 0 20px rgba(0,212,255,.4))}50%{transform:scale(1.05);filter:drop-shadow(0 0 40px rgba(0,212,255,.7))}}
+.logo-breath{animation:logoBreath 4s ease-in-out infinite}
+@keyframes rotateRing{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.rotating-ring{animation:rotateRing 20s linear infinite}
+.rotating-ring-reverse{animation:rotateRing 30s linear infinite reverse}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
+.float{animation:float 5s ease-in-out infinite}
+.spinner{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:rotateRing .8s linear infinite}

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#05060f">
+<title>SHAHEEN - YS | Cloud Infrastructure Platform</title>
+<link rel="icon" href="img/shaheen-logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/glass.css">
+<link rel="stylesheet" href="css/animations.css">
+<style>
+.hero{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;padding:40px 24px;text-align:center}
+.hero-visual{position:relative;width:min(300px,65vw);height:min(300px,65vw);margin-bottom:40px;display:flex;align-items:center;justify-content:center}
+.hero-logo{width:100%;height:100%;object-fit:contain;position:relative;z-index:2;border-radius:50%}
+.ring{position:absolute;border-radius:50%;border:1px solid rgba(0,212,255,.3);pointer-events:none}
+.ring-1{inset:-10%;border-top-color:var(--shaheen-primary);border-right-color:transparent}
+.ring-2{inset:-22%;border-bottom-color:var(--shaheen-secondary);border-left-color:transparent;border-style:dashed}
+.ring-3{inset:-34%;border-left-color:var(--shaheen-accent);border-right-color:transparent;opacity:.4}
+.hero-title{font-size:clamp(2.5rem,8vw,5rem);font-weight:900;letter-spacing:-.04em;line-height:1;margin-bottom:12px}
+.hero-subtitle{font-size:clamp(1rem,2.5vw,1.25rem);color:var(--text-secondary);max-width:640px;margin:0 auto 40px;line-height:1.6}
+.hero-tag{display:inline-flex;align-items:center;gap:8px;padding:8px 18px;background:var(--glass-bg);backdrop-filter:var(--glass-blur);border:1px solid var(--glass-border);border-radius:999px;font-size:13px;color:var(--text-secondary);margin-bottom:24px;font-weight:500;letter-spacing:.5px}
+.hero-tag .status-dot{width:8px;height:8px}
+.hero-actions{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;margin-bottom:60px}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;max-width:900px;width:100%;margin:0 auto}
+.stat-card{padding:22px 18px;text-align:center}
+.stat-value{font-size:1.75rem;font-weight:800;font-family:'JetBrains Mono',monospace;margin-bottom:4px}
+.stat-label{font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1.5px;font-weight:600}
+.footer{position:absolute;bottom:24px;left:0;right:0;text-align:center;font-size:12px;color:var(--text-muted)}
+.footer a{color:var(--shaheen-primary);text-decoration:none;font-weight:500}
+@media(max-width:640px){.hero-actions{flex-direction:column;width:100%}.hero-actions .btn{width:100%}}
+</style>
+</head>
+<body>
+<section class="hero">
+<div class="hero-tag fade-in-up"><span class="status-dot connected"></span><span id="statusText">SYSTEM ONLINE</span></div>
+<div class="hero-visual">
+<div class="ring ring-1 rotating-ring"></div>
+<div class="ring ring-2 rotating-ring-reverse"></div>
+<div class="ring ring-3 rotating-ring"></div>
+<img src="img/shaheen-logo.png" alt="SHAHEEN - YS" class="hero-logo logo-breath">
+</div>
+<h1 class="hero-title fade-in-up delay-1"><span class="text-gradient">SHAHEEN - YS</span></h1>
+<p class="hero-subtitle fade-in-up delay-2">Enterprise-grade cloud infrastructure platform powered by <strong style="color:var(--shaheen-primary)">Crossplane</strong> and <strong style="color:var(--shaheen-secondary)">KubeVirt</strong>. Declarative. Secure. Scalable.</p>
+<div class="hero-actions fade-in-up delay-3">
+<a href="login.html" class="btn btn-primary"><span>Get Started</span><span style="font-size:18px">→</span></a>
+<a href="https://github.com/DON-YS/SHAHEEN---YS" target="_blank" rel="noopener" class="btn btn-glass"><span>⭐</span><span>View on GitHub</span></a>
+</div>
+<div class="stats-grid fade-in-up delay-4">
+<div class="glass stat-card"><div class="stat-value text-gradient">99.9%</div><div class="stat-label">Uptime SLA</div></div>
+<div class="glass stat-card"><div class="stat-value text-gradient">&lt; 1s</div><div class="stat-label">Reconcile</div></div>
+<div class="glass stat-card"><div class="stat-value text-gradient">∞</div><div class="stat-label">Scalability</div></div>
+<div class="glass stat-card"><div class="stat-value text-gradient">24/7</div><div class="stat-label">Monitoring</div></div>
+</div>
+</section>
+<div class="footer fade-in delay-5">© 2024-2026 <strong>SHAHEEN - YS</strong> · Built by <a href="https://github.com/DON-YS" target="_blank">Yousef Z. A. Shaheen</a></div>
+<script src="js/api.js"></script>
+<script>
+(async()=>{try{const d=await API.health();document.getElementById('statusText').textContent=`${d.service||'SYSTEM'} · PHASE ${d.phase||'1'}`}catch(e){document.getElementById('statusText').textContent='BACKEND OFFLINE';document.querySelectorAll('.status-dot').forEach(el=>{el.classList.remove('connected');el.classList.add('error')})}})();
+if(Storage.getUser())setTimeout(()=>window.location.href='dashboard.html',300);
+</script>
+</body>
+</html>
