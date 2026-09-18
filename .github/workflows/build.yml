@@ -3,8 +3,6 @@ name: Build SHAHEEN-YS
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
@@ -22,13 +20,13 @@ jobs:
       - name: Build Crossplane
         run: |
           cd components/crossplane
-          make build
+          go build -v ./...
 
       - name: Upload Crossplane Binary
         uses: actions/upload-artifact@v4
         with:
           name: crossplane-binary
-          path: components/crossplane/_output/bin/
+          path: components/crossplane/crossplane
 
   build-kubevirt:
     runs-on: ubuntu-latest
@@ -49,10 +47,10 @@ jobs:
       - name: Build KubeVirt
         run: |
           cd components/kubevirt
-          make
+          go build -v ./...
 
       - name: Upload KubeVirt Binary
         uses: actions/upload-artifact@v4
         with:
           name: kubevirt-binary
-          path: components/kubevirt/_out/cmd/
+          path: components/kubevirt/_out/
